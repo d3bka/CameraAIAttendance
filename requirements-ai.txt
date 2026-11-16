@@ -1,0 +1,4 @@
+# Optional: AI face-recognition worker (face_worker.py). The platform server itself needs only Python 3.10+.
+opencv-python>=4.8,<5
+numpy>=1.24,<3
+requests>=2.31,<3

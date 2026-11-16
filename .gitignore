@@ -1,0 +1,32 @@
+# ---- Personal data & secrets: NEVER commit ----
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+photos/
+.env
+.env.*
+*.pem
+*.key
+credentials*.txt
+creds*.txt
+
+# ---- Models (downloaded & hash-verified by face_worker.py --download-models) ----
+models/
+*.onnx
+*.part
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Local test media ----
+*.avi
+*.mp4
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png

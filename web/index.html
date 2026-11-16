@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:,">
+  <title>Camera Attendance AI</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<div id="login-view" class="login-view" hidden>
+  <form id="login-form" class="login-card" autocomplete="on">
+    <div class="brand"><span class="brand-icon">◎</span><div>Camera<span class="accent">AI</span><small>ATTENDANCE PLATFORM</small></div></div>
+    <h1>Вход</h1>
+    <label>Логин<input name="username" autocomplete="username" required maxlength="40"></label>
+    <label>Пароль<input name="password" type="password" autocomplete="current-password" required maxlength="128"></label>
+    <button class="btn primary" type="submit">Войти</button>
+    <div id="login-error" class="form-error" role="alert"></div>
+  </form>
+</div>
+
+<div id="app-view" class="app" hidden>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-icon">◎</span><div>Camera<span class="accent">AI</span><small>ATTENDANCE PLATFORM</small></div></div>
+    <div class="nav-title">РАБОЧАЯ ОБЛАСТЬ</div>
+    <nav id="nav"></nav>
+    <div class="side-bottom"><div class="privacy">Фото и события хранятся только на вашем сервере. Кадры с камер не сохраняются.</div></div>
+  </aside>
+  <main>
+    <header class="top">
+      <div class="breadcrumbs"><span id="crumb-school">—</span><span class="sep">/</span><strong id="crumb">Обзор</strong></div>
+      <div class="top-right">
+        <select id="school-switch" class="school-switch" aria-label="Школа" hidden></select>
+        <button id="user-chip" class="user-chip" type="button" title="Профиль"><span id="user-name"></span><small id="user-role"></small></button>
+        <button id="logout" class="btn secondary small" type="button">Выйти</button>
+      </div>
+    </header>
+    <div id="content" class="content"></div>
+  </main>
+</div>
+
+<dialog id="dialog"><div id="dialog-body"></div></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
