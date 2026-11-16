@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import json
 import os
 import random
 import struct
@@ -61,6 +62,31 @@ def cmd_set_password(args):
     print(f'Пароль пользователя {args.username} обновлён, все его сессии завершены.')
     if generated:
         print(f'Новый пароль (показывается один раз): {password}')
+
+
+def cmd_worker_config(args):
+    """Create a device token + a ready-to-fill config with every camera of the school."""
+    store = open_store(args)
+    school = store.get_school(args.school_id)
+    cameras = [c for c in store.list_cameras(args.school_id) if c['kind'] != 'observe']
+    if not cameras:
+        raise SystemExit('У школы нет камер (кроме «наблюдения»). Добавьте их в панели: «Камеры и AI».')
+    out = Path(args.out) if args.out else ROOT / 'data' / f'cameras-school-{args.school_id}.json'
+    if out.exists() and not args.force:
+        raise SystemExit(f'{out} уже существует. Используйте --force, чтобы перезаписать (старый токен останется активным).')
+    token = store.create_token(args.school_id, {'name': f'AI worker ({out.name})'})['token']
+    config = {
+        'api': args.api,
+        'token': token,
+        'cameras': {c['camera_key']: 'rtsp://USER:PASSWORD@CAMERA_IP:554/Streaming/Channels/101' for c in cameras},
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f"Школа: {school['name']}")
+    print(f'Конфиг: {out}  (в .gitignore; содержит токен — не пересылайте его)')
+    print('Впишите RTSP-адрес каждой камеры (основной поток 1080p), затем:')
+    print(f'  .venv\\Scripts\\python face_worker.py --config "{out}"')
+    print('  или автозапуск: powershell -ExecutionPolicy Bypass -File scripts\\install_autostart.ps1')
 
 
 def cmd_purge(args):
@@ -275,6 +301,12 @@ def main(argv=None):
     p.add_argument('--reset', action='store_true', help='Удалить и пересоздать ранее созданные тестовые школы')
     p.add_argument('--random-seed', type=int, default=None)
     p.set_defaults(fn=cmd_seed_demo)
+    p = sub.add_parser('worker-config', help='Создать токен и конфиг AI-воркера со всеми камерами школы')
+    p.add_argument('--school-id', type=int, required=True)
+    p.add_argument('--api', default='http://127.0.0.1:8080')
+    p.add_argument('--out')
+    p.add_argument('--force', action='store_true')
+    p.set_defaults(fn=cmd_worker_config)
     p = sub.add_parser('purge', help='Удалить события/отметки старше N дней')
     p.add_argument('--days', type=int, default=365)
     p.set_defaults(fn=cmd_purge)

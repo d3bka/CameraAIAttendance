@@ -9,7 +9,7 @@ const ROLE_NAMES = { superadmin: 'Супер-админ', school_admin: 'Адм�
 const KIND_NAMES = { entry: 'Вход', exit: 'Выход', classroom: 'Класс (AI)', observe: 'Наблюдение' };
 const STATUS = {
   present: ['Присутствует', 'good'], late: ['Опоздал', 'warn'], absent: ['Отсутствует', 'bad'],
-  excused: ['Уваж. причина', 'info'], not_seen: ['Не замечен', 'bad soft'], no_data: ['Нет данных', 'dim'],
+  excused: ['Уваж. причина', 'info'], not_seen: ['Не замечен', 'warn soft'], no_data: ['Нет данных', 'dim'],
   needs_review: ['Проверить', 'warn'], upcoming: ['—', 'muted'], in_progress: ['Идёт урок', 'info soft'],
 };
 const PHOTO_STATUS = {
@@ -287,7 +287,7 @@ pages.overview = async () => {
   const stats = h('div', { class: 'stats' },
     statCard('Учеников', st.students, `${st.ai_ready} с фото, готовыми для AI`),
     statCard('Замечены', st.seen_today, 'Камера, СКУД или отметка учителя'),
-    statCard('Не замечены', st.not_seen, 'Это ещё не «отсутствует» — проверьте журнал'),
+    statCard('Не замечены', st.not_seen, 'Ни камера, ни СКУД, ни учитель не отметили сегодня'),
     statCard('Камеры онлайн', `${st.cameras_online}/${st.cameras}`, 'По сигналам AI-воркера (3 мин)'));
   const alerts = [];
   if (st.pending_reviews) alerts.push(h('div', { class: 'alert warn' }, `Ожидают проверки учителем: ${st.pending_reviews} распознаваний с низкой уверенностью. `,
@@ -355,7 +355,7 @@ pages.attendance = async () => {
       classPicker(classes, classId, id => { state.cache.classId = id; refresh(); }), datePicker(date, d => { state.cache.date = d; refresh(); }),
       h('button', { class: 'btn secondary', type: 'button', onclick: refresh }, '↻')),
     panel(h('div', { class: 'panel-title-row' }, h('h2', {}, `${a.class.name} · ${WEEKDAYS_FULL[a.weekday]}, ${a.date}`), legend), body),
-    h('div', { class: 'note' }, h('b', {}, 'Как читать: '), '«Не замечен» — камера работала, но ребёнка не узнала: подтвердите отсутствие. «Нет данных» — камера была офлайн или её нет: отметьте вручную. Система никогда не ставит «Отсутствует» сама.'));
+    h('div', { class: 'note' }, h('b', {}, 'Как читать: '), 'отметки ставятся автоматически по камерам и расписанию. «Отсутствует» — камера исправно работала весь урок, а ребёнка в кадре не было. «Нет данных» — камера была офлайн: система не гадает и просит отметить вручную. Любую отметку можно исправить кликом — ручная всегда главнее.'));
 };
 
 function markDialog(student, lesson, cell, date) {
@@ -515,7 +515,8 @@ pages.cameras = async () => {
   const rows = cameras.map(c => h('tr', {},
     h('td', {}, h('strong', {}, c.name), h('div', { class: 'device-meta' }, c.camera_key)),
     h('td', {}, c.room), h('td', {}, KIND_NAMES[c.kind]),
-    h('td', {}, c.online ? tag('онлайн', 'good') : tag(c.last_seen_at ? 'офлайн' : 'нет сигнала', 'bad'), h('div', { class: 'device-meta' }, c.last_seen_at ? 'сигнал ' + fmtDateTime(c.last_seen_at) : '')),
+    h('td', {}, c.online ? (c.stats && c.stats.idle ? tag('ждёт урока', 'info') : tag('смотрит', 'good')) : tag(c.last_seen_at ? 'офлайн' : 'нет сигнала', c.kind === 'classroom' ? 'bad' : 'dim'),
+      h('div', { class: 'device-meta' }, c.last_seen_at ? 'сигнал ' + fmtDateTime(c.last_seen_at) + (c.online && c.stats && !c.stats.idle && c.stats.faces !== undefined ? ` · лиц/мин: ${c.stats.faces}` : '') : '')),
     isAdmin() ? h('td', { class: 'actions' }, h('button', { class: 'mini-btn', type: 'button', onclick: async () => {
       if (!await confirmDialog(`Удалить камеру ${c.name}? Её события будут удалены.`)) return;
       try { await api(sPath('/cameras/' + c.id), 'DELETE'); toast('Камера удалена'); refresh(); } catch (e) { toast(e.message, true); }
@@ -530,18 +531,23 @@ pages.cameras = async () => {
     field('Опоздание после начала урока, мин', input('late_grace_min', { type: 'number', min: 0, max: 60, value: school.late_grace_min })),
     field('Авто-отметка при уверенности от', input('face_auto_threshold', { type: 'number', step: '0.01', min: 0.3, max: 0.95, value: school.face_auto_threshold })),
     field('На проверку учителю при уверенности от', input('face_review_threshold', { type: 'number', step: '0.01', min: 0.2, max: 0.95, value: school.face_review_threshold })),
+    h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'auto_absent', checked: !!school.auto_absent }),
+      h('span', {}, 'Автоматически ставить «Отсутствует», если камера работала весь урок, а ребёнка не было в кадре')),
     h('button', { class: 'btn primary', type: 'submit' }, 'Сохранить')), async data => {
-    await api(`/api/s/${state.sid}`, 'PUT', { late_grace_min: Number(data.late_grace_min), face_auto_threshold: Number(data.face_auto_threshold), face_review_threshold: Number(data.face_review_threshold) });
+    await api(`/api/s/${state.sid}`, 'PUT', { late_grace_min: Number(data.late_grace_min), face_auto_threshold: Number(data.face_auto_threshold),
+      face_review_threshold: Number(data.face_review_threshold), auto_absent: data.auto_absent });
     toast('Настройки сохранены');
   }) : null;
-  const cmd = 'python face_worker.py --camera-key <идентификатор> --api http://<сервер>:8000';
   return h('div', {}, heading('DEVICES & AI', 'Камеры и распознавание', 'Каждая камера в классе обслуживается AI-воркером, который шлёт распознавания и сигнал «я работаю» раз в минуту.'),
     h('div', { class: 'twocol form-layout' },
       h('div', {}, panel('Камеры школы', table(['Камера', 'Кабинет', 'Тип', 'Статус', isAdmin() ? '' : null].filter(x => x !== null), rows, 'Камер нет')),
-        panel('Запуск AI-воркера', h('ol', { class: 'steps' },
-          h('li', {}, 'Создайте токен устройства в разделе «Токены устройств».'),
-          h('li', {}, 'На компьютере рядом с камерами: ', h('code', {}, 'pip install -r requirements-ai.txt'), ' и ', h('code', {}, 'python face_worker.py --download-models')),
-          h('li', {}, 'Задайте ', h('code', {}, 'ATTENDANCE_INGEST_TOKEN'), ' и ', h('code', {}, 'ATTENDANCE_RTSP_URL'), ' (основной поток камеры, не sub-stream), затем: ', h('code', {}, cmd))),
+        panel('Автоматический режим', h('ol', { class: 'steps' },
+          h('li', {}, 'Добавьте камеры кабинетов и привяжите их к урокам в «Расписании».'),
+          h('li', {}, 'На компьютере в сети камер: ', h('code', {}, `py -3 manage.py worker-config --school-id ${state.sid}`),
+            ' — создаст токен и файл со списком камер; впишите в него RTSP-адреса (основной поток 1080p).'),
+          h('li', {}, 'Один раз: ', h('code', {}, 'powershell -ExecutionPolicy Bypass -File scripts\\install_autostart.ps1'),
+            ' — платформа и AI будут запускаться сами при включении компьютера.')),
+          h('div', { class: 'note' }, 'Дальше всё автоматически: AI включает каждую камеру только на время её уроков, сам отмечает присутствие, опоздания и отсутствие, а сигнал «камера работает» приходит раз в минуту.'),
         h('div', { class: 'note' }, h('b', {}, 'Старые камеры: '), 'если лица в кадре меньше ~40 px, AI их пропустит, а урок получит статус «нет данных», а не «отсутствует». Используйте основной поток 1080p, камеру над доской, направленную на парты.'))),
       h('div', {}, camForm ? panel('Новая камера', camForm) : null, settings ? panel('Параметры AI и опозданий', settings,
         h('div', { class: 'note' }, 'Рекомендуемо: авто 0.45, проверка 0.363. Выше порог — меньше ошибок, но больше ручной проверки.')) : null)));

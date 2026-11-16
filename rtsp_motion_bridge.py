@@ -78,7 +78,7 @@ def run(args):
 def main():
     parser=argparse.ArgumentParser(description='RTSP motion -> unverified camera events')
     parser.add_argument('--camera-key',required=True)
-    parser.add_argument('--api',default='http://127.0.0.1:8000')
+    parser.add_argument('--api',default='http://127.0.0.1:8080')
     parser.add_argument('--interval',type=float,default=1.0,help='Sampling period, seconds')
     parser.add_argument('--min-changed-pixels',type=int,default=8000,help='Motion sensitivity, 480x270 frame')
     parser.add_argument('--cooldown',type=float,default=20.0,help='Minimum seconds between events')

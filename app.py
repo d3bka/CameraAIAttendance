@@ -557,6 +557,11 @@ def worker_roster(h):
     return h.server.store.worker_roster(h.token_sid)
 
 
+@route('GET', r'/api/worker/schedule', 'token')
+def worker_schedule(h):
+    return h.server.store.worker_schedule(h.token_sid)
+
+
 @route('GET', r'/api/worker/photos/(\d{1,9})', 'token')
 def worker_photo(h, pid):
     path, mime = h.server.store.photo_file(h.token_sid, pid)
@@ -572,7 +577,7 @@ def worker_photo_quality(h, pid):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Camera Attendance AI platform server')
     parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--db', default=str(ROOT / 'data' / 'platform.sqlite3'))
     parser.add_argument('--allow-remote', action='store_true', help='Bind to a non-loopback address (only behind HTTPS proxy)')
     parser.add_argument('--secure-cookies', action='store_true', help='Mark cookies Secure and send HSTS (HTTPS proxy)')

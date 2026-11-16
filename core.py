@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 import queue
 import re
@@ -49,6 +50,9 @@ LOCK_DURATION = timedelta(minutes=15)
 CAMERA_ONLINE_SECONDS = 180
 PRE_LESSON_MINUTES = 10
 MIN_CAMERA_COVERAGE = 0.6
+AGGREGATE_PENDING_HITS = 2
+ENTRY_WINDOW_BEFORE = timedelta(minutes=90)
+ENTRY_WINDOW_AFTER = timedelta(minutes=30)
 PBKDF2_ITERATIONS = int(os.environ.get('ATTENDANCE_PBKDF2_ITERATIONS', '600000'))
 
 CODE_RE = re.compile(r'^[a-zA-Z0-9_.-]{1,50}$')
@@ -223,6 +227,7 @@ SCHEMA = '''
 CREATE TABLE IF NOT EXISTS schools (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT NOT NULL DEFAULT '',
     late_grace_min INTEGER NOT NULL DEFAULT 10,
+    auto_absent INTEGER NOT NULL DEFAULT 1,
     face_auto_threshold REAL NOT NULL DEFAULT 0.45,
     face_review_threshold REAL NOT NULL DEFAULT 0.363,
     created_at TEXT NOT NULL
@@ -366,6 +371,10 @@ class Store:
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript(SCHEMA)
+            # lightweight migrations for databases created by earlier versions
+            school_cols = {r['name'] for r in db.execute('PRAGMA table_info(schools)')}
+            if 'auto_absent' not in school_cols:
+                db.execute('ALTER TABLE schools ADD COLUMN auto_absent INTEGER NOT NULL DEFAULT 1')
 
     # ------------------------------------------------------------------ audit
     def _audit(self, db, actor, school_id, action, detail=''):
@@ -412,7 +421,8 @@ class Store:
             return [dict(r) for r in rows]
 
     def _school_fields(self, payload, current=None):
-        cur = current or {'late_grace_min': 10, 'face_auto_threshold': 0.45, 'face_review_threshold': 0.363, 'city': ''}
+        cur = current or {'late_grace_min': 10, 'face_auto_threshold': 0.45, 'face_review_threshold': 0.363, 'city': '',
+                          'auto_absent': 1}
         name = require_text(payload['name'], 'Название', 120) if 'name' in payload else cur.get('name')
         if name is None:
             raise InputError('Название обязательно')
@@ -422,14 +432,17 @@ class Store:
         review = require_float(payload.get('face_review_threshold', cur['face_review_threshold']), 'Порог проверки', 0.20, 0.95)
         if review > auto:
             raise InputError('Порог проверки должен быть не выше порога авто-отметки')
-        return name, city, grace, auto, review
+        auto_absent = payload.get('auto_absent', cur['auto_absent'])
+        if auto_absent not in (True, False, 0, 1):
+            raise InputError('auto_absent: true или false')
+        return name, city, grace, auto, review, int(auto_absent)
 
     def create_school(self, payload, actor=None):
-        name, city, grace, auto, review = self._school_fields(payload)
+        name, city, grace, auto, review, auto_absent = self._school_fields(payload)
         with self.connect() as db:
             try:
-                cur = db.execute('INSERT INTO schools(name,city,late_grace_min,face_auto_threshold,face_review_threshold,created_at) '
-                                 'VALUES(?,?,?,?,?,?)', (name, city, grace, auto, review, iso(now_utc())))
+                cur = db.execute('INSERT INTO schools(name,city,late_grace_min,auto_absent,face_auto_threshold,face_review_threshold,'
+                                 'created_at) VALUES(?,?,?,?,?,?,?)', (name, city, grace, auto_absent, auto, review, iso(now_utc())))
             except sqlite3.IntegrityError:
                 raise InputError('Школа с таким названием уже существует') from None
             sid = cur.lastrowid
@@ -439,13 +452,13 @@ class Store:
     def update_school(self, sid, payload, actor=None):
         with self.connect() as db:
             current = self._school(db, sid)
-            name, city, grace, auto, review = self._school_fields(payload, current)
+            name, city, grace, auto, review, auto_absent = self._school_fields(payload, current)
             try:
-                db.execute('UPDATE schools SET name=?,city=?,late_grace_min=?,face_auto_threshold=?,face_review_threshold=? WHERE id=?',
-                           (name, city, grace, auto, review, sid))
+                db.execute('UPDATE schools SET name=?,city=?,late_grace_min=?,auto_absent=?,face_auto_threshold=?,face_review_threshold=? '
+                           'WHERE id=?', (name, city, grace, auto_absent, auto, review, sid))
             except sqlite3.IntegrityError:
                 raise InputError('Школа с таким названием уже существует') from None
-            self._audit(db, actor, sid, 'school.update', f'grace={grace} auto={auto} review={review}')
+            self._audit(db, actor, sid, 'school.update', f'grace={grace} auto={auto} review={review} auto_absent={auto_absent}')
             return self._school(db, sid)
 
     def delete_school(self, sid, actor=None):
@@ -875,6 +888,10 @@ class Store:
                                                 'FROM cameras WHERE school_id=? ORDER BY name', (sid,))]
         for r in rows:
             r['online'] = bool(r['last_seen_at'] and r['last_ok'] and from_iso(r['last_seen_at']) >= cutoff)
+            try:
+                r['stats'] = json.loads(r.pop('last_stats') or '{}')
+            except ValueError:
+                r['stats'] = {}
         return rows
 
     def create_camera(self, sid, payload, actor=None):
@@ -906,18 +923,55 @@ class Store:
     def heartbeat(self, sid, payload):
         key = require_code(payload.get('camera_key'), 'camera_key')
         ok = payload.get('ok') is True
+        idle = payload.get('idle') is True  # worker sleeps outside lesson time: alive, but not watching
         stats = {k: payload[k] for k in ('frames', 'faces', 'matches', 'small_faces', 'gallery', 'fps')
                  if isinstance(payload.get(k), (int, float)) and not isinstance(payload.get(k), bool)}
+        if idle:
+            stats['idle'] = 1
         now = now_utc()
         with self.connect() as db:
             cam = db.execute('SELECT id FROM cameras WHERE camera_key=? AND school_id=?', (key, sid)).fetchone()
             if cam is None:
                 raise InputError('Неизвестная камера; сначала добавьте её в панели')
             db.execute('UPDATE cameras SET last_seen_at=?,last_ok=?,last_stats=? WHERE id=?',
-                       (iso(now), int(ok), repr(stats)[:300], cam['id']))
-            if ok:
+                       (iso(now), int(ok), json.dumps(stats)[:300], cam['id']))
+            if ok and not idle:
                 db.execute('INSERT OR IGNORE INTO camera_uptime(camera_id,minute) VALUES(?,?)', (cam['id'], minute_key(now)))
         return {'ok': True}
+
+    def worker_schedule(self, sid, day=None):
+        """When each camera must be watched today (UTC ISO windows), so workers run unattended
+        and only spend CPU during lessons (classroom) or arrival/leaving time (entry/exit)."""
+        d = parse_day(day) if day else datetime.now(TZ).date()
+        with self.connect() as db:
+            self._school(db, sid)
+            cameras = [dict(r) for r in db.execute('SELECT id,camera_key,kind FROM cameras WHERE school_id=?', (sid,))]
+            lessons = [dict(r) for r in db.execute('SELECT camera_id,start_time,end_time FROM lessons WHERE school_id=? AND weekday=?',
+                                                   (sid, d.isoweekday()))]
+
+        def at(hhmm):
+            return datetime.combine(d, dtime.fromisoformat(hhmm), TZ)
+
+        first = min((at(l['start_time']) for l in lessons), default=None)
+        last = max((at(l['end_time']) for l in lessons), default=None)
+        windows = {}
+        for cam in cameras:
+            spans = []
+            if cam['kind'] == 'classroom':
+                spans = [(at(l['start_time']) - timedelta(minutes=PRE_LESSON_MINUTES), at(l['end_time']))
+                         for l in lessons if l['camera_id'] == cam['id']]
+            elif cam['kind'] == 'entry' and first:
+                spans = [(first - ENTRY_WINDOW_BEFORE, last + ENTRY_WINDOW_AFTER)]
+            elif cam['kind'] == 'exit' and first:
+                spans = [(first, last + ENTRY_WINDOW_BEFORE)]
+            merged = []
+            for a, b in sorted(spans):
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            windows[cam['camera_key']] = [[iso(a), iso(b)] for a, b in merged]
+        return {'date': d.isoformat(), 'windows': windows}
 
     # ------------------------------------------------------------------ lessons (schedule)
     def list_lessons(self, sid, class_id=None):
@@ -1100,10 +1154,14 @@ class Store:
     def attendance(self, sid, class_id, day, now=None):
         """Per-lesson attendance grid for one class and day.
 
-        Priority: manual mark > verified AI/ACS evidence > camera-health-aware fallback.
-        A child is never reported 'absent' automatically: without evidence the result is
-        'not_seen' (camera worked, child not recognised -> teacher should confirm) or
-        'no_data' (camera offline / no camera -> teacher must mark manually).
+        Priority: manual mark > AI/ACS evidence > camera-health-aware automatic decision.
+        * seen with high confidence, or >= AGGREGATE_PENDING_HITS medium-confidence sightings
+          in the lesson window -> present / late (fully automatic);
+        * a single medium-confidence sighting -> needs_review;
+        * camera verifiably worked (coverage >= MIN_CAMERA_COVERAGE) but child never seen
+          -> 'absent' when the school's auto_absent is on, otherwise 'not_seen';
+        * camera offline / no evidence source -> 'no_data': the system cannot know, so it never
+          guesses (a broken camera must not turn a whole class "absent").
         """
         d = parse_day(day)
         now = now or now_utc()
@@ -1125,6 +1183,10 @@ class Store:
                 'LEFT JOIN users u ON u.id=m.set_by JOIN students s ON s.id=m.student_id '
                 'WHERE m.school_id=? AND m.day=? AND s.class_id=?', (sid, d.isoformat(), class_id))}
             has_entry_devices = db.execute("SELECT COUNT(*) FROM cameras WHERE school_id=? AND kind='entry'", (sid,)).fetchone()[0] > 0
+            # entry devices (turnstiles) send no heartbeat: treat them as working if they reported anyone that day
+            entry_worked = db.execute("SELECT COUNT(*) FROM events e JOIN cameras c ON c.id=e.camera_id WHERE e.school_id=? "
+                                      "AND e.local_day=? AND c.kind='entry' AND e.verified=1", (sid, d.isoformat())).fetchone()[0] > 0
+            auto_absent = bool(school['auto_absent'])
             grace = timedelta(minutes=school['late_grace_min'])
             for lesson in lessons:
                 start = datetime.combine(d, dtime.fromisoformat(lesson['start_time']), TZ)
@@ -1154,16 +1216,20 @@ class Store:
             evs = by_student.get(student['id'], [])
             if lesson['camera_id']:
                 window = start - timedelta(minutes=PRE_LESSON_MINUTES)
-                seen = [t for cam, t, ok, _ in evs if ok and cam == lesson['camera_id'] and window <= t <= end]
+                in_window = [(t, ok, rs) for cam, t, ok, rs in evs if cam == lesson['camera_id'] and window <= t <= end]
+                seen = [t for t, ok, _ in in_window if ok]
+                pending = [t for t, _, rs in in_window if rs == 'pending']
+                if not seen and len(pending) >= AGGREGATE_PENDING_HITS:
+                    seen = pending  # repeated medium-confidence sightings of the same child -> accept automatically
                 if seen:
                     first = min(seen)
                     return {'status': 'present' if first <= start + grace else 'late', 'source': 'ai', 'first_seen': iso(first)}
-                if any(rs == 'pending' and cam == lesson['camera_id'] and window <= t <= end for cam, t, _, rs in evs):
+                if pending:
                     return {'status': 'needs_review', 'source': 'ai'}
                 if now < end:
                     return {'status': 'in_progress', 'source': None}
                 if (lesson['coverage'] or 0) >= MIN_CAMERA_COVERAGE:
-                    return {'status': 'not_seen', 'source': 'ai'}
+                    return {'status': 'absent' if auto_absent else 'not_seen', 'source': 'ai'}
                 return {'status': 'no_data', 'source': None}
             first_in = entry_first.get(student['id'])
             if first_in and first_in <= start + grace:
@@ -1172,7 +1238,9 @@ class Store:
                 return {'status': 'late', 'source': 'entry', 'first_seen': iso(first_in)}
             if now < end:
                 return {'status': 'in_progress', 'source': None}
-            return {'status': 'not_seen' if has_entry_devices else 'no_data', 'source': 'entry' if has_entry_devices else None}
+            if has_entry_devices and entry_worked:
+                return {'status': 'absent' if auto_absent else 'not_seen', 'source': 'entry'}
+            return {'status': 'no_data', 'source': None}
 
         rows = []
         for st in students:

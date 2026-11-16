@@ -54,6 +54,42 @@ class FaceWorkerLogicTest(unittest.TestCase):
         self.assertNotIn('admin', red)
         self.assertIn('10.0.0.5', red)
 
+    def test_schedule_windows(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 11, 16, 5, 0, tzinfo=timezone.utc)
+        s = fw.Schedule()
+        self.assertTrue(s.active('room1', now))           # not loaded yet -> watch rather than miss a lesson
+        s.update({'windows': {'room1': [[(now - timedelta(minutes=5)).isoformat(), (now + timedelta(minutes=40)).isoformat()]],
+                              'room2': []}})
+        self.assertTrue(s.active('room1', now))
+        self.assertFalse(s.active('room1', now + timedelta(hours=2)))
+        self.assertFalse(s.active('room2', now))
+        self.assertFalse(s.active('unknown', now))
+        self.assertIsNone(s.next_start('room1', now))
+        self.assertTrue(fw.Schedule(always_on=True).active('room2', now))
+
+    def test_config_loading(self):
+        import json
+        import os
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / 'cameras.json'
+            cfg.write_text(json.dumps({'api': 'http://10.0.0.2:8080', 'token': 'cat_x',
+                                       'cameras': {'room201': 'rtsp://u:p@10.0.0.5/101', 'gate': '0'}}), encoding='utf-8')
+            args = SimpleNamespace(config=str(cfg), api='http://127.0.0.1:8080', source=None, camera_key=None, check_photos=False)
+            saved = os.environ.pop('ATTENDANCE_INGEST_TOKEN', None)
+            try:
+                cams, token = fw.load_cameras(args)
+            finally:
+                if saved is not None:
+                    os.environ['ATTENDANCE_INGEST_TOKEN'] = saved
+            self.assertEqual(set(cams), {'room201', 'gate'})
+            self.assertEqual((token, args.api), ('cat_x', 'http://10.0.0.2:8080'))
+            cfg.write_text('{"cameras": {}}', encoding='utf-8')
+            with self.assertRaises(SystemExit):
+                fw.load_cameras(args)
+
     def test_models_pinned(self):
         for name, url, digest in fw.MODELS.values():
             self.assertTrue(url.startswith('https://'))

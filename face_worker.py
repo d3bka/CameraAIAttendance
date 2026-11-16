@@ -1,25 +1,27 @@
-"""AI face-recognition worker for ordinary IP cameras (RTSP / webcam / video file).
+"""AI face-recognition worker for ordinary classroom IP cameras (RTSP / webcam / video file).
 
-One process per camera. Pipeline:
-  RTSP frame (latest only) -> YuNet face detector -> quality gates (size, blur)
+Runs unattended: ONE process watches ALL cameras of a school (one thread per camera) and
+connects to each camera only during its lessons, taken live from the platform schedule.
+Pipeline per frame:
+  latest RTSP frame -> YuNet face detector -> quality gates (size, blur)
   -> SFace embedding -> cosine match against the school's enrolled photos
   -> temporal confirmation (N hits in a time window) -> POST /api/ingest (face_match)
-Every minute it sends a heartbeat, so the platform knows when a camera was blind and
-reports "no data" instead of wrongly marking children absent.
+Every minute each camera sends a heartbeat, so the platform knows when a camera was blind
+and reports "no data" instead of wrongly marking a class absent.
 
 Privacy: frames and face crops are never written to disk; face templates live in memory only.
 
     pip install -r requirements-ai.txt
     python face_worker.py --download-models
-    $env:ATTENDANCE_INGEST_TOKEN="cat_..."            # school device token from the panel
-    $env:ATTENDANCE_RTSP_URL="rtsp://user:pass@192.168.1.20:554/Streaming/Channels/101"
-    python face_worker.py --camera-key school1_room201
+    python face_worker.py --config data/cameras.json            # all cameras, schedule-driven
+    python face_worker.py --camera-key room201 --source 0 --show # quick test with a webcam
 """
 from __future__ import annotations
 
 import argparse
 import collections
 import hashlib
+import json
 import logging
 import os
 import statistics
@@ -249,17 +251,25 @@ class FrameGrabber(threading.Thread):
 
 
 class Platform:
-    def __init__(self, api: str, token: str, camera_key: str):
+    """HTTP client for one thread (requests.Session is not shared between threads)."""
+
+    def __init__(self, api: str, token: str, camera_key: str = ''):
         self.api = api.rstrip('/')
         self.camera_key = camera_key
         self.session = requests.Session()
         self.session.headers['X-Ingest-Token'] = token
         self.outbox: collections.deque = collections.deque(maxlen=2000)
 
-    def roster(self):
-        r = self.session.get(self.api + '/api/worker/roster', timeout=15)
+    def get_json(self, path):
+        r = self.session.get(self.api + path, timeout=15)
         r.raise_for_status()
         return r.json()
+
+    def roster(self):
+        return self.get_json('/api/worker/roster')
+
+    def schedule(self):
+        return self.get_json('/api/worker/schedule')
 
     def photo(self, pid):
         r = self.session.get(f'{self.api}/api/worker/photos/{pid}', timeout=30)
@@ -272,13 +282,14 @@ class Platform:
         except requests.RequestException:
             pass
 
-    def heartbeat(self, ok, stats):
+    def heartbeat(self, ok, stats, idle=False):
         try:
-            r = self.session.post(self.api + '/api/worker/heartbeat', json={'camera_key': self.camera_key, 'ok': ok, **stats}, timeout=10)
+            r = self.session.post(self.api + '/api/worker/heartbeat',
+                                  json={'camera_key': self.camera_key, 'ok': ok, 'idle': idle, **stats}, timeout=10)
             if r.status_code >= 400:
-                LOG.warning('Heartbeat rejected: HTTP %s %s', r.status_code, r.text[:200])
+                LOG.warning('[%s] heartbeat rejected: HTTP %s %s', self.camera_key, r.status_code, r.text[:200])
         except requests.RequestException as exc:
-            LOG.warning('Heartbeat failed: %s', type(exc).__name__)
+            LOG.warning('[%s] heartbeat failed: %s', self.camera_key, type(exc).__name__)
 
     def send_match(self, code, confidence):
         self.outbox.append({'camera_key': self.camera_key, 'event_uid': 'face-' + uuid.uuid4().hex,
@@ -294,23 +305,37 @@ class Platform:
             try:
                 r = self.session.post(self.api + '/api/ingest', json=event, timeout=10)
             except requests.RequestException:
-                LOG.warning('Platform unreachable; %d event(s) queued', len(self.outbox))
+                LOG.warning('[%s] platform unreachable; %d event(s) queued', self.camera_key, len(self.outbox))
                 return
             self.outbox.popleft()
             if r.status_code >= 400:
-                LOG.warning('Event rejected: HTTP %s %s', r.status_code, r.text[:200])
+                LOG.warning('[%s] event rejected: HTTP %s %s', self.camera_key, r.status_code, r.text[:200])
             else:
                 body = r.json()
-                LOG.info('Recognised %s (%.2f) -> %s', event['person_code'], event['confidence'],
+                LOG.info('[%s] recognised %s (%.2f) -> %s', self.camera_key, event['person_code'], event['confidence'],
                          'confirmed' if body.get('verified') else body.get('review_status') or body.get('reason'))
 
 
-def sync_gallery(engine: FaceEngine, platform: Platform, gallery: Gallery, min_face_px=60):
+class SharedGallery:
+    """Gallery used by all camera threads; rebuilt atomically by the sync thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.gallery = Gallery()
+        self.review_threshold = 0.363
+
+    def match(self, feature, margin):
+        with self.lock:
+            return self.gallery.match(feature, margin), self.review_threshold
+
+
+def sync_gallery(engine: FaceEngine, platform: Platform, shared: SharedGallery, min_face_px=60):
     roster = platform.roster()
     entries = []
+    cache = shared.gallery.by_sha
     for student in roster['students']:
         for photo in student['photos']:
-            cached = gallery.by_sha.get(photo['sha256'])
+            cached = cache.get(photo['sha256'])
             if cached is None:
                 feature, status = None, 'unreadable'
                 try:
@@ -325,118 +350,253 @@ def sync_gallery(engine: FaceEngine, platform: Platform, gallery: Gallery, min_f
                     LOG.warning('Photo download failed: %s', type(exc).__name__)
                     continue
                 cached = (status, feature)
-                gallery.by_sha[photo['sha256']] = cached
                 if status != photo.get('face_status'):
                     platform.photo_quality(photo['id'], status)
-            entries.append((student['code'], cached[1]))
-    gallery.rebuild(entries)
-    LOG.info('Gallery: %d template(s) for %d student(s)', len(gallery.codes), gallery.students)
+            entries.append((student['code'], photo['sha256'], cached))
+    fresh = Gallery()
+    fresh.by_sha = {sha: cached for _, sha, cached in entries}
+    fresh.rebuild((code, cached[1]) for code, _, cached in entries)
+    with shared.lock:
+        shared.gallery = fresh
+        shared.review_threshold = roster['face_review_threshold']
+    LOG.info('Gallery: %d template(s) for %d student(s)', len(fresh.codes), fresh.students)
     return roster
 
 
-def run(args):
-    token = os.environ.get('ATTENDANCE_INGEST_TOKEN')
+class Schedule:
+    """Today's watch windows per camera, refreshed from the platform (lessons can change any time)."""
+
+    def __init__(self, always_on=False):
+        self.always_on = always_on
+        self.lock = threading.Lock()
+        self.windows: dict[str, list] = {}
+        self.loaded = False
+
+    def update(self, data):
+        parsed = {key: [(datetime.fromisoformat(a), datetime.fromisoformat(b)) for a, b in spans]
+                  for key, spans in data['windows'].items()}
+        with self.lock:
+            self.windows, self.loaded = parsed, True
+
+    def active(self, camera_key, now=None):
+        if self.always_on:
+            return True
+        now = now or datetime.now(timezone.utc)
+        with self.lock:
+            if not self.loaded:
+                return True  # platform unreachable at start: better to watch than to miss a lesson
+            return any(a <= now <= b for a, b in self.windows.get(camera_key, []))
+
+    def next_start(self, camera_key, now=None):
+        now = now or datetime.now(timezone.utc)
+        with self.lock:
+            upcoming = [a for a, _ in self.windows.get(camera_key, []) if a > now]
+        return min(upcoming) if upcoming else None
+
+
+class CameraWorker(threading.Thread):
+    """Watches one camera: connects only inside its schedule window, recognises, reports, heartbeats."""
+
+    def __init__(self, camera_key, source, paths, token, shared, schedule, args, stop_event):
+        super().__init__(daemon=True, name=f'cam-{camera_key}')
+        self.camera_key, self.source, self.paths = camera_key, source, paths
+        self.shared, self.schedule, self.args, self.stop_event = shared, schedule, args, stop_event
+        self.platform = Platform(args.api, token, camera_key)
+        self.confirmer = Confirmer(args.min_hits, args.window, args.cooldown)
+        self.stats = collections.Counter()
+        self.finished = False  # a video file reached its end
+
+    def run(self):
+        try:
+            self._loop()
+        except Exception:  # never let one broken camera kill the whole worker silently
+            LOG.exception('[%s] camera thread crashed', self.camera_key)
+        finally:
+            self.finished = True
+
+    def _loop(self):
+        args = self.args
+        engine = FaceEngine(self.paths, det_score=args.det_score)  # OpenCV DNN objects are per-thread
+        grabber = None
+        last_frames, last_heartbeat, last_frame_time = 0, time.monotonic(), 0.0
+        period = 1.0 / args.fps
+        src = str(self.source)
+        src_label = 'webcam' if src.isdigit() else ('video file' if Path(src).is_file() else redact(src))
+        try:
+            while not self.stop_event.is_set():
+                loop_start = time.monotonic()
+                active = self.schedule.active(self.camera_key)
+                if active and grabber is None:
+                    LOG.info('[%s] lesson window open -> connecting to %s', self.camera_key, src_label)
+                    grabber = FrameGrabber(self.source)
+                    grabber.start()
+                    last_frames = 0
+                elif not active and grabber is not None:
+                    nxt = self.schedule.next_start(self.camera_key)
+                    LOG.info('[%s] window closed -> camera released%s', self.camera_key,
+                             f'; next at {nxt.astimezone().strftime("%H:%M")}' if nxt else '; no more lessons today')
+                    grabber.stop.set()
+                    grabber = None
+                if grabber is not None:
+                    frame, frame_time = grabber.latest()
+                    if frame is not None and frame_time != last_frame_time:
+                        last_frame_time = frame_time
+                        self.process(engine, frame)
+                    if grabber.is_file and grabber.stop.is_set():
+                        LOG.info('[%s] video file finished', self.camera_key)
+                        return
+                now = time.monotonic()
+                if now - last_heartbeat >= 60:
+                    if grabber is not None:
+                        frames = grabber.frames - last_frames
+                        last_frames = grabber.frames
+                        self.platform.heartbeat(frames > 0, self.heartbeat_stats(now - last_heartbeat, frames))
+                        self.warn_small_faces()
+                    else:
+                        self.platform.heartbeat(True, {}, idle=True)
+                    self.stats.clear()
+                    last_heartbeat = now
+                    self.platform.flush()
+                sleep = period if grabber is not None else 5.0
+                self.stop_event.wait(max(0.0, sleep - (time.monotonic() - loop_start)))
+        finally:
+            if grabber is not None:
+                grabber.stop.set()
+            self.platform.flush()
+
+    def process(self, engine, frame):
+        args = self.args
+        self.stats['processed'] += 1
+        faces = engine.detect(frame, max_width=args.det_width)
+        self.stats['faces'] += len(faces)
+        for face in faces:
+            if face[2] < args.min_face:
+                self.stats['small_faces'] += 1
+                continue
+            feature, crop = engine.embed(frame, face)
+            if blur_score(crop) < args.min_sharpness:
+                self.stats['blurry'] += 1
+                continue
+            found, review_threshold = self.shared.match(feature, args.margin)
+            if found is None:
+                self.stats['ambiguous'] += 1
+                continue
+            code, score, _ = found
+            if score < review_threshold:
+                self.stats['unknown'] += 1
+                continue
+            confidence = self.confirmer.observe(code, score, time.monotonic())
+            if confidence is not None:
+                self.stats['matches'] += 1
+                self.platform.send_match(code, confidence)
+        if args.show:
+            preview = frame.copy()
+            for face in faces:
+                x, y, w, h = face[:4].astype(int)
+                cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0) if w >= args.min_face else (0, 0, 255), 2)
+            cv2.imshow(f'{self.camera_key} (q = quit)', preview)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.stop_event.set()
+
+    def heartbeat_stats(self, elapsed, frames):
+        with self.shared.lock:
+            gallery = self.shared.gallery.students
+        return {'frames': frames, 'faces': self.stats['faces'], 'matches': self.stats['matches'],
+                'small_faces': self.stats['small_faces'], 'gallery': gallery,
+                'fps': round(self.stats['processed'] / max(elapsed, 1e-6), 2)}
+
+    def warn_small_faces(self):
+        if self.stats['faces'] > 20 and self.stats['small_faces'] > self.stats['faces'] * 0.5:
+            LOG.warning('[%s] most faces are too small (<%d px): use the main 1080p stream, not the sub stream, '
+                        'or move/zoom the camera closer to the desks.', self.camera_key, self.args.min_face)
+
+
+def load_cameras(args):
+    """Camera list from --config JSON (all cameras of a school) or the single --camera-key/--source pair."""
+    if args.config:
+        try:
+            config = json.loads(Path(args.config).read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f'Cannot read config {args.config}: {exc}')
+        cameras = config.get('cameras')
+        if not isinstance(cameras, dict) or not cameras:
+            raise SystemExit('Config must contain "cameras": {"camera_key": "rtsp://..."}')
+        if config.get('api'):
+            args.api = config['api']
+        token = os.environ.get('ATTENDANCE_INGEST_TOKEN') or config.get('token')
+        return {str(k): str(v) for k, v in cameras.items()}, token
     source = args.source or os.environ.get('ATTENDANCE_RTSP_URL')
-    if not token:
-        raise SystemExit('Set ATTENDANCE_INGEST_TOKEN (school device token from the admin panel)')
     if not source and not args.check_photos:
-        raise SystemExit('Set ATTENDANCE_RTSP_URL or pass --source (0 = local webcam, or a video file)')
+        raise SystemExit('Use --config cameras.json, or --camera-key with ATTENDANCE_RTSP_URL / --source (0 = webcam)')
+    return ({args.camera_key: source} if args.camera_key else {}), os.environ.get('ATTENDANCE_INGEST_TOKEN')
+
+
+def run(args):
+    cameras, token = load_cameras(args)
+    if not token:
+        raise SystemExit('Set ATTENDANCE_INGEST_TOKEN (school device token from the admin panel) or "token" in the config')
     paths = ensure_models(Path(args.models_dir), download=args.download_models)
     engine = FaceEngine(paths, det_score=args.det_score)
-    platform = Platform(args.api, token, args.camera_key)
-    gallery = Gallery()
-    roster = sync_gallery(engine, platform, gallery, args.enroll_min_face)
-    review_threshold = roster['face_review_threshold']
+    control = Platform(args.api, token, 'control')
+    shared = SharedGallery()
+    sync_gallery(engine, control, shared, args.enroll_min_face)
     if args.check_photos:
         LOG.info('Photo check finished; see statuses in the admin panel')
         return
-    if not gallery.codes:
+    if not shared.gallery.codes:
         LOG.warning('No usable reference photos yet: upload clear frontal photos (2-5 per child)')
-
-    grabber = FrameGrabber(source)
-    LOG.info('Camera %s, source %s', args.camera_key, redact(str(source)) if not str(source).isdigit() else 'webcam')
-    grabber.start()
-    confirmer = Confirmer(args.min_hits, args.window, args.cooldown)
-    stats = collections.Counter()
-    last_frames, last_heartbeat, last_sync, last_frame_time = 0, time.monotonic(), time.monotonic(), 0.0
-    period = 1.0 / args.fps
+    schedule = Schedule(always_on=args.always_on)
     try:
-        while True:
-            loop_start = time.monotonic()
-            frame, frame_time = grabber.latest()
-            if frame is not None and frame_time != last_frame_time:
-                last_frame_time = frame_time
-                stats['processed'] += 1
-                faces = engine.detect(frame, max_width=args.det_width)
-                stats['faces'] += len(faces)
-                for face in faces:
-                    if face[2] < args.min_face:
-                        stats['small_faces'] += 1
-                        continue
-                    feature, crop = engine.embed(frame, face)
-                    if blur_score(crop) < args.min_sharpness:
-                        stats['blurry'] += 1
-                        continue
-                    found = gallery.match(feature, margin=args.margin)
-                    if found is None:
-                        stats['ambiguous'] += 1
-                        continue
-                    code, score, _ = found
-                    if score < review_threshold:
-                        stats['unknown'] += 1
-                        continue
-                    confidence = confirmer.observe(code, score, time.monotonic())
-                    if confidence is not None:
-                        stats['matches'] += 1
-                        platform.send_match(code, confidence)
-                if args.show:
-                    preview = frame.copy()
-                    for face in faces:
-                        x, y, w, h = face[:4].astype(int)
-                        cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0) if w >= args.min_face else (0, 0, 255), 2)
-                    cv2.imshow('face_worker (q = quit)', preview)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+        schedule.update(control.schedule())
+    except requests.RequestException as exc:
+        LOG.warning('Schedule unavailable (%s); cameras stay on until it loads', type(exc).__name__)
+    unknown = [k for k in cameras if schedule.loaded and k not in schedule.windows]
+    for key in unknown:
+        LOG.warning('[%s] camera_key is not registered for this school in the panel; its events will be rejected', key)
+    stop_event = threading.Event()
+    workers = [CameraWorker(key, src, paths, token, shared, schedule, args, stop_event) for key, src in cameras.items()]
+    for w in workers:
+        w.start()
+    LOG.info('Watching %d camera(s): %s%s', len(workers), ', '.join(cameras),
+             ' (always on)' if args.always_on else ' (only during lessons)')
+    last_sync = last_sched = time.monotonic()
+    try:
+        while not stop_event.is_set() and not all(w.finished for w in workers):
+            stop_event.wait(5)
             now = time.monotonic()
-            if now - last_heartbeat >= 60:
-                frames = grabber.frames - last_frames
-                last_frames = grabber.frames
-                platform.heartbeat(frames > 0, {'frames': frames, 'faces': stats['faces'], 'matches': stats['matches'],
-                                                'small_faces': stats['small_faces'], 'gallery': gallery.students,
-                                                'fps': round(stats['processed'] / (now - last_heartbeat), 2)})
-                if stats['small_faces'] > stats['faces'] * 0.5 and stats['faces'] > 20:
-                    LOG.warning('Most faces are too small (<%d px). Use a higher-resolution stream (main stream, '
-                                'not sub stream) or move/zoom the camera closer to the seats.', args.min_face)
-                stats.clear()
-                last_heartbeat = now
-                platform.flush()
+            if now - last_sched >= args.schedule_every:
+                try:
+                    schedule.update(control.schedule())
+                except requests.RequestException as exc:
+                    LOG.warning('Schedule refresh failed: %s', type(exc).__name__)
+                last_sched = now
             if now - last_sync >= args.sync_every:
                 try:
-                    review_threshold = sync_gallery(engine, platform, gallery, args.enroll_min_face)['face_review_threshold']
+                    sync_gallery(engine, control, shared, args.enroll_min_face)
                 except requests.RequestException as exc:
                     LOG.warning('Gallery sync failed: %s', type(exc).__name__)
                 last_sync = now
-            if grabber.stop.is_set():
-                break
-            time.sleep(max(0.0, period - (time.monotonic() - loop_start)))
     except KeyboardInterrupt:
         pass
     finally:
-        grabber.stop.set()
-        platform.flush()
+        stop_event.set()
+        for w in workers:
+            w.join(10)
         if args.show:
             cv2.destroyAllWindows()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='AI face recognition worker (one camera per process)')
-    parser.add_argument('--camera-key', help='camera_key registered in the admin panel')
-    parser.add_argument('--api', default='http://127.0.0.1:8000')
-    parser.add_argument('--source', help='RTSP URL, webcam index (0) or video file; default: $ATTENDANCE_RTSP_URL')
+    parser = argparse.ArgumentParser(description='AI face recognition worker for classroom IP cameras')
+    parser.add_argument('--config', help='JSON: {"api": "...", "cameras": {"camera_key": "rtsp://..."}} - all cameras in one process')
+    parser.add_argument('--camera-key', help='single camera mode: camera_key registered in the admin panel')
+    parser.add_argument('--api', default='http://127.0.0.1:8080')
+    parser.add_argument('--source', help='single camera mode: RTSP URL, webcam index (0) or video file; default $ATTENDANCE_RTSP_URL')
+    parser.add_argument('--always-on', action='store_true', help='Ignore the schedule and watch cameras 24/7')
     parser.add_argument('--models-dir', default=str(ROOT / 'models'))
-    parser.add_argument('--download-models', action='store_true', help='Download & verify models (then continue if --camera-key given)')
+    parser.add_argument('--download-models', action='store_true', help='Download & verify models')
     parser.add_argument('--check-photos', action='store_true', help='Only validate enrolled photos and report their quality')
-    parser.add_argument('--fps', type=float, default=2.0, help='Frames analysed per second (CPU budget)')
+    parser.add_argument('--fps', type=float, default=2.0, help='Frames analysed per second per camera (CPU budget)')
     parser.add_argument('--det-width', type=int, default=1280, help='Max width for face detection (higher finds smaller faces)')
     parser.add_argument('--det-score', type=float, default=0.75)
     parser.add_argument('--min-face', type=int, default=40, help='Ignore faces narrower than this (pixels, full frame)')
@@ -446,16 +606,17 @@ def main(argv=None):
     parser.add_argument('--min-hits', type=int, default=3)
     parser.add_argument('--window', type=float, default=20.0)
     parser.add_argument('--cooldown', type=float, default=300.0)
-    parser.add_argument('--sync-every', type=float, default=300.0)
+    parser.add_argument('--sync-every', type=float, default=300.0, help='Seconds between photo/gallery refreshes')
+    parser.add_argument('--schedule-every', type=float, default=120.0, help='Seconds between schedule refreshes')
     parser.add_argument('--show', action='store_true', help='Debug preview window (local use only)')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    if args.download_models and not args.camera_key:
+    if args.download_models and not (args.camera_key or args.config):
         ensure_models(Path(args.models_dir), download=True)
         LOG.info('Models ready in %s', args.models_dir)
         return
-    if not args.camera_key:
-        parser.error('--camera-key is required')
+    if not (args.camera_key or args.config or args.check_photos):
+        parser.error('--config or --camera-key is required')
     if not 0.1 <= args.fps <= 15 or args.min_hits < 1 or args.window <= 0:
         parser.error('fps 0.1-15, min-hits >= 1, window > 0')
     run(args)

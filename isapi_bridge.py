@@ -149,7 +149,7 @@ def main():
     parser.add_argument('--user',default='admin')
     parser.add_argument('--camera-key',required=True,help='Existing camera_key from admin panel')
     parser.add_argument('--allowed-minor',action='append',default=[],help='Verified access-success minor event code on this device (repeatable)')
-    parser.add_argument('--api',default='http://127.0.0.1:8000')
+    parser.add_argument('--api',default='http://127.0.0.1:8080')
     args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     listen(args)

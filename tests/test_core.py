@@ -241,17 +241,61 @@ class AttendanceTests(Base):
         self.assertEqual(cell('S1', l1), 'present')
         self.assertEqual(cell('S2', l1), 'late')
         self.assertEqual(cell('S3', l1), 'needs_review')
-        self.assertEqual(cell('S4', l1), 'not_seen')    # camera worked, child not recognised
-        self.assertEqual(cell('S4', l2), 'no_data')     # camera offline -> never "absent"
+        self.assertEqual(cell('S4', l1), 'absent')      # camera worked all lesson, child never seen -> automatic absent
+        self.assertEqual(cell('S4', l2), 'no_data')     # camera offline -> never guessed
         self.assertEqual(cell('S1', l3), 'present')     # no classroom camera -> school entry
         self.assertEqual(cell('S2', l3), 'late')
-        self.assertEqual(cell('S4', l3), 'not_seen')
+        self.assertEqual(cell('S4', l3), 'absent')      # turnstile worked that day, child never passed
         self.store.set_mark(self.a, {'student_id': self.students['S4'], 'lesson_id': l2, 'day': day.isoformat(), 'status': 'excused'}, SUPER)
         grid = self.store.attendance(self.a, self.cls, day.isoformat())
         self.assertEqual(cell('S4', l2), 'excused')
         self.store.set_mark(self.a, {'student_id': self.students['S4'], 'lesson_id': l2, 'day': day.isoformat(), 'status': 'clear'}, SUPER)
         grid = self.store.attendance(self.a, self.cls, day.isoformat())
         self.assertEqual(cell('S4', l2), 'no_data')
+        # two medium-confidence sightings in one lesson are accepted without a human
+        self.face('S3', at('10:12'), 0.41)
+        grid = self.store.attendance(self.a, self.cls, day.isoformat())
+        self.assertEqual(cell('S3', l1), 'present')
+        # schools that prefer human confirmation can switch automatic absence off
+        self.store.update_school(self.a, {'auto_absent': False}, SUPER)
+        grid = self.store.attendance(self.a, self.cls, day.isoformat())
+        self.assertEqual(cell('S4', l1), 'not_seen')
+        self.assertEqual(cell('S4', l3), 'not_seen')
+
+    def test_worker_schedule_and_idle_heartbeat(self):
+        wd = datetime.now(TZ).isoweekday()
+        self.store.create_lesson(self.a, {'class_id': self.cls, 'weekday': wd, 'start_time': '09:00', 'end_time': '09:45',
+                                          'subject': 'A', 'camera_id': self.cams['a_room']})
+        self.store.create_lesson(self.a, {'class_id': self.cls, 'weekday': wd, 'start_time': '09:50', 'end_time': '10:35',
+                                          'subject': 'B', 'camera_id': self.cams['a_room']})
+        w = self.store.worker_schedule(self.a)['windows']
+        self.assertEqual(len(w['a_room']), 1)           # 08:50-09:45 and 09:40-10:35 merge into one window
+        self.assertEqual(w['a_room2'], [])               # no lessons in that room -> camera stays off
+        self.assertEqual(w['a_hall'], [])                # observe cameras are never processed
+        self.assertEqual(len(w['a_gate']), 1)            # entry: arrival window around the school day
+        self.assertEqual(self.store.worker_schedule(self.b)['windows'], {})
+        self.store.heartbeat(self.a, {'camera_key': 'a_room', 'ok': True, 'idle': True})
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM camera_uptime').fetchone()[0], 0)
+        cams = {c['camera_key']: c for c in self.store.list_cameras(self.a)}
+        self.assertTrue(cams['a_room']['online'])        # idle worker is still reported alive in the panel
+        self.store.heartbeat(self.a, {'camera_key': 'a_room', 'ok': True})
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM camera_uptime').fetchone()[0], 1)
+
+    def test_migration_adds_auto_absent(self):
+        import sqlite3
+        path = Path(self.tmp.name) / 'old.sqlite3'
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE schools (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT NOT NULL DEFAULT '', "
+                     "late_grace_min INTEGER NOT NULL DEFAULT 10, face_auto_threshold REAL NOT NULL DEFAULT 0.45, "
+                     "face_review_threshold REAL NOT NULL DEFAULT 0.363, created_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO schools(name, created_at) VALUES('Old', '2026-01-01')")
+        conn.commit()
+        conn.close()
+        old = Store(path)
+        self.assertEqual(old.list_schools()[0]['auto_absent'], 1)
+        old.close()
 
     def test_mark_validation(self):
         today = datetime.now(TZ).date()
