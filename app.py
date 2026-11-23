@@ -23,15 +23,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import imports
 from core import Forbidden, InputError, NotFound, Store, local_today, TZ_NAME
 
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 64 * 1024
 MAX_UPLOAD_BODY = 5 * 1024 * 1024
+MAX_IMPORT_BODY = 8 * 1024 * 1024
 SESSION_COOKIE = 'cat_sid'
 LOG = logging.getLogger('attendance')
 
-STATIC = {'/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}
+STATIC = {'/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/features.js': 'features.js',
+          '/style.css': 'style.css'}
 CONTENT_TYPES = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8', 'css': 'text/css; charset=utf-8'}
 PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
             "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
@@ -76,19 +79,21 @@ class ApiServer(ThreadingHTTPServer):
         self.secure_cookies = secure_cookies
         self.trust_proxy = trust_proxy
         self.throttle = LoginThrottle()
+        self.form_throttle = LoginThrottle(limit=5, window=3600)
         super().__init__(address, Handler)
 
 
 ROUTES = []
 
 
-def route(method, pattern, auth):
+def route(method, pattern, auth, limit=None, raw=False):
     """auth: public | session | super | staff | admin | token.
-    staff/admin routes start with /api/s/<sid>/ and are restricted to that school."""
+    staff/admin routes start with /api/s/<sid>/ and are restricted to that school.
+    limit: max request body; raw=True passes the body as bytes (file uploads) instead of JSON."""
     regex = re.compile('^' + pattern + '$')
 
     def wrap(fn):
-        ROUTES.append((method, regex, auth, fn))
+        ROUTES.append((method, regex, auth, fn, {'limit': limit, 'raw': raw}))
         return fn
     return wrap
 
@@ -162,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
             parts.append('Secure')
         return '; '.join(parts)
 
-    def read_body(self, limit):
+    def read_body(self, limit, raw=False):
         if self.headers.get('Transfer-Encoding'):
             raise InputError('Chunked bodies are not supported')
         try:
@@ -171,6 +176,14 @@ class Handler(BaseHTTPRequestHandler):
             raise InputError('Invalid Content-Length') from None
         if length < 0 or length > limit:
             raise InputError('Тело запроса слишком большое')
+        if raw:
+            data = bytearray()
+            while len(data) < length:
+                chunk = self.rfile.read(min(1 << 20, length - len(data)))
+                if not chunk:
+                    raise InputError('Загрузка прервана')
+                data.extend(chunk)
+            return bytes(data)
         if length == 0:
             return {}
         if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
@@ -218,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
             if not path.startswith('/api/'):
                 return self.respond(404, {'error': 'Not found'})
             allowed = False
-            for m, regex, auth, fn in ROUTES:
+            for m, regex, auth, fn, opts in ROUTES:
                 match = regex.match(path)
                 if not match:
                     continue
@@ -228,14 +241,14 @@ class Handler(BaseHTTPRequestHandler):
                 args = [int(g) for g in match.groups()]
                 if not self.authorize(auth, method, args):
                     return
-                limit = MAX_UPLOAD_BODY if path.endswith('/photos') and method == 'POST' else MAX_BODY
-                self.body = self.read_body(limit) if method in ('POST', 'PUT') else {}
+                limit = opts['limit'] or (MAX_UPLOAD_BODY if path.endswith('/photos') and method == 'POST' else MAX_BODY)
+                self.body = self.read_body(limit, opts['raw']) if method in ('POST', 'PUT') else {}
                 result = fn(self, *args)
                 if result is not None:
                     self.respond(200, result)
                 return
             return self.respond(405 if allowed else 404, {'error': 'Method not allowed' if allowed else 'Not found'})
-        except (NotFound, Forbidden, InputError) as exc:
+        except (NotFound, Forbidden, InputError, imports.ImportError_) as exc:
             return self.respond(getattr(exc, 'status', 400), {'error': str(exc)})
         except (BrokenPipeError, ConnectionResetError):
             return
@@ -534,6 +547,128 @@ def create_token(h, sid):
 @route('DELETE', r'/api/s/(\d{1,9})/tokens/(\d{1,9})', 'admin')
 def revoke_token(h, sid, tid):
     return h.server.store.revoke_token(sid, tid, h.actor())
+
+
+# ============================================================== onboarding: invitations & applications
+def _throttled(h, throttle):
+    if throttle.blocked(h.client_ip()):
+        h.respond(429, {'error': 'Слишком много попыток. Повторите позже.'})
+        return True
+    return False
+
+
+@route('POST', r'/api/invites/info', 'public')
+def invite_info(h):
+    if _throttled(h, h.server.throttle):
+        return None
+    try:
+        return h.server.store.invite_info(h.body.get('token'))
+    except NotFound:
+        h.server.throttle.fail(h.client_ip())
+        raise
+
+
+@route('POST', r'/api/invites/accept', 'public')
+def invite_accept(h):
+    if _throttled(h, h.server.throttle):
+        return None
+    try:
+        user = h.server.store.accept_invite(h.body.get('token'), h.body)
+    except NotFound:
+        h.server.throttle.fail(h.client_ip())
+        raise
+    token, csrf = h.server.store.create_session(user['id'], h.client_ip())
+    h.respond(200, {'user': _me(user), 'csrf': csrf}, {'Set-Cookie': h.session_cookie(token, 12 * 3600)})
+
+
+@route('POST', r'/api/invites', 'session')
+def invite_create(h):
+    if h.user['role'] == 'teacher':
+        raise Forbidden('Недостаточно прав')
+    return h.server.store.create_invite(h.body, h.actor())
+
+
+@route('POST', r'/api/users/(\d{1,9})/reset-link', 'session')
+def reset_link(h, uid):
+    if h.user['role'] == 'teacher':
+        raise Forbidden('Недостаточно прав')
+    return h.server.store.create_reset_invite(uid, h.actor())
+
+
+@route('POST', r'/api/applications', 'public')
+def application_submit(h):
+    if _throttled(h, h.server.form_throttle):
+        return None
+    h.server.form_throttle.fail(h.client_ip())  # every submission counts: max 5 per hour per IP
+    return h.server.store.submit_application(h.body, h.client_ip())
+
+
+@route('GET', r'/api/applications', 'super')
+def applications(h):
+    return {'applications': h.server.store.list_applications()}
+
+
+@route('POST', r'/api/applications/(\d{1,9})', 'super')
+def application_decide(h, aid):
+    return h.server.store.decide_application(aid, h.body.get('decision'), h.actor())
+
+
+# ============================================================== bulk import / export / edits
+def _decode_upload(h):
+    data = h.body.get('data_base64')
+    if not isinstance(data, str):
+        raise InputError('data_base64 is required')
+    try:
+        return base64.b64decode(data.split(',', 1)[-1] if data.startswith('data:') else data, validate=True)
+    except (binascii.Error, ValueError):
+        raise InputError('Некорректные данные файла') from None
+
+
+@route('GET', r'/api/import/template.csv', 'session')
+def import_template(h):
+    h.send_bytes(imports.TEMPLATE_CSV.encode('utf-8'), 'text/csv; charset=utf-8', csp="default-src 'none'")
+
+
+@route('POST', r'/api/s/(\d{1,9})/import/students', 'admin', limit=MAX_IMPORT_BODY)
+def import_students(h, sid):
+    rows, errors = imports.parse_students(str(h.body.get('filename', '')), _decode_upload(h))
+    result = h.server.store.import_students(sid, rows, h.actor(), dry_run=h.body.get('dry_run', True) is not False,
+                                            consent=h.body.get('consent_confirmed') is True)
+    result['errors'] = errors + result['errors']
+    return result
+
+
+@route('POST', r'/api/s/(\d{1,9})/import/photos', 'admin', limit=imports.MAX_ZIP_BYTES, raw=True)
+def import_photos(h, sid):
+    if h.headers.get('Content-Type', '').split(';')[0].strip().lower() not in ('application/zip', 'application/x-zip-compressed',
+                                                                               'application/octet-stream'):
+        raise InputError('Ожидается ZIP-архив')
+    return h.server.store.import_photos(sid, imports.photo_entries(h.body), h.actor())
+
+
+@route('POST', r'/api/s/(\d{1,9})/students/bulk', 'admin')
+def students_bulk(h, sid):
+    return h.server.store.bulk_students(sid, h.body, h.actor())
+
+
+@route('POST', r'/api/s/(\d{1,9})/lessons/copy-day', 'admin')
+def lessons_copy_day(h, sid):
+    return h.server.store.copy_schedule_day(sid, h.body, h.actor())
+
+
+@route('GET', r'/api/s/(\d{1,9})/export/attendance.csv', 'staff')
+def export_attendance(h, sid):
+    today = local_today()
+    header, rows = h.server.store.export_attendance(sid, h.query('from') or today, h.query('to') or today, h.query_int('class_id'))
+    data = imports.csv_bytes(header, rows)
+    h.send_response(200)
+    h.send_header('Content-Type', 'text/csv; charset=utf-8')
+    h.send_header('Content-Disposition', f'attachment; filename="attendance_{h.query("from") or today}.csv"')
+    h.send_header('Content-Length', str(len(data)))
+    h.send_header('Cache-Control', 'no-store')
+    h.common_headers()
+    h.end_headers()
+    h.wfile.write(data)
 
 
 # ============================================================== devices / AI worker (school token)

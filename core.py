@@ -61,6 +61,9 @@ CODE_RE = re.compile(r'^[a-zA-Z0-9_.-]{1,50}$')
 USERNAME_RE = re.compile(r'^[a-zA-Z0-9_.@-]{3,40}$')
 HHMM_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
 LOGIN_FAILED = 'Неверный логин или пароль (после 5 ошибок вход блокируется на 15 минут)'
+INVITE_TTL = timedelta(hours=72)
+PHONE_RE = re.compile(r'^\+?[0-9 ()\-]{7,20}$')
+EMAIL_RE = re.compile(r'^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,20}$')
 PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
 
 
@@ -309,6 +312,19 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, user_id INTEGER, username TEXT NOT NULL DEFAULT '',
     school_id INTEGER, action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS invites (
+    id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('user','reset')),
+    role TEXT, school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, full_name TEXT NOT NULL DEFAULT '',
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL, created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL, used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY, school_name TEXT NOT NULL, city TEXT NOT NULL DEFAULT '', contact_name TEXT NOT NULL,
+    phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', students_estimate INTEGER, message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','approved','rejected')), school_id INTEGER,
+    ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, decided_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_school_day ON events(school_id, local_day, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_student_day ON events(student_id, local_day);
@@ -765,7 +781,16 @@ class Store:
         return dict(row)
 
     def create_student(self, sid, payload, actor=None):
-        code = require_code(payload.get('code'), 'Код ученика')
+        code = payload.get('code')
+        if code in (None, ''):
+            with self.connect() as db:
+                n = db.execute('SELECT COUNT(*) FROM students WHERE school_id=?', (sid,)).fetchone()[0]
+                while True:
+                    n += 1
+                    code = f'S{sid}-{n:05d}'
+                    if db.execute('SELECT 1 FROM students WHERE school_id=? AND code=?', (sid, code)).fetchone() is None:
+                        break
+        code = require_code(code, 'Код ученика')
         full_name = require_text(payload.get('full_name'), 'ФИО', 120)
         class_id = require_int(payload.get('class_id'), 'Класс', 1, 2**31)
         if payload.get('consent_confirmed') is not True:
@@ -1314,3 +1339,293 @@ class Store:
             db.execute('DELETE FROM sessions WHERE expires_at<?', (iso(now_utc()),))
             self._audit(db, None, None, 'maintenance.purge', f'before {cutoff}: events={ev} marks={mk}')
         return {'events': ev, 'marks': mk, 'uptime': up, 'audit': au, 'cutoff': cutoff}
+
+    # ------------------------------------------------------------------ invitations (no passwords sent around)
+    def create_invite(self, payload, actor):
+        """One-time 72 h link that lets a person set their own login and password."""
+        role = payload.get('role')
+        if role not in ('school_admin', 'teacher'):
+            raise InputError('Приглашать можно администратора школы или учителя')
+        sid = require_int(payload.get('school_id'), 'Школа', 1, 2**31)
+        full_name = require_text(payload.get('full_name'), 'ФИО', 120)
+        if actor.get('role') != 'superadmin' and (actor.get('role') != 'school_admin' or role != 'teacher'
+                                                  or sid != actor.get('school_id')):
+            raise Forbidden('Администратор школы может приглашать только учителей своей школы')
+        token = 'inv_' + secrets.token_urlsafe(24)
+        now = now_utc()
+        with self.connect() as db:
+            self._school(db, sid)
+            db.execute('INSERT INTO invites(token_hash,kind,role,school_id,full_name,created_by,created_at,expires_at) '
+                       'VALUES(?,?,?,?,?,?,?,?)', (sha256_hex(token), 'user', role, sid, full_name, actor.get('id'),
+                                                   iso(now), iso(now + INVITE_TTL)))
+            self._audit(db, actor, sid, 'invite.create', f'{role} {full_name}')
+        return {'token': token, 'expires_at': iso(now + INVITE_TTL)}
+
+    def create_reset_invite(self, uid, actor):
+        with self.connect() as db:
+            row = self._managed_user(db, uid, actor)
+            token = 'inv_' + secrets.token_urlsafe(24)
+            now = now_utc()
+            db.execute('INSERT INTO invites(token_hash,kind,user_id,school_id,full_name,created_by,created_at,expires_at) '
+                       'VALUES(?,?,?,?,?,?,?,?)', (sha256_hex(token), 'reset', uid, row['school_id'], row['full_name'],
+                                                   actor.get('id'), iso(now), iso(now + INVITE_TTL)))
+            self._audit(db, actor, row['school_id'], 'invite.reset', row['username'])
+        return {'token': token, 'expires_at': iso(now + INVITE_TTL)}
+
+    def _invite(self, db, token):
+        if not isinstance(token, str) or not token.startswith('inv_') or len(token) > 80:
+            raise NotFound('Ссылка недействительна')
+        row = db.execute('SELECT i.*, s.name AS school_name, u.username FROM invites i LEFT JOIN schools s ON s.id=i.school_id '
+                         'LEFT JOIN users u ON u.id=i.user_id WHERE i.token_hash=?', (sha256_hex(token),)).fetchone()
+        if row is None or row['used_at'] or from_iso(row['expires_at']) <= now_utc():
+            raise NotFound('Ссылка недействительна или уже использована. Попросите новую.')
+        return row
+
+    def invite_info(self, token):
+        with self.connect() as db:
+            row = self._invite(db, token)
+        return {'kind': row['kind'], 'role': row['role'], 'school_name': row['school_name'],
+                'full_name': row['full_name'], 'username': row['username']}
+
+    def accept_invite(self, token, payload):
+        password = require_password(payload.get('password'))
+        with self.connect() as db:
+            row = self._invite(db, token)
+            if row['kind'] == 'reset':
+                db.execute('UPDATE users SET password_hash=?,failed_logins=0,locked_until=NULL,active=1 WHERE id=?',
+                           (hash_password(password), row['user_id']))
+                db.execute('DELETE FROM sessions WHERE user_id=?', (row['user_id'],))
+                uid = row['user_id']
+            else:
+                username = payload.get('username')
+                if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
+                    raise InputError('Логин: 3-40 символов (латиница, цифры, _ . @ -)')
+                try:
+                    uid = db.execute('INSERT INTO users(username,password_hash,full_name,role,school_id,created_at) '
+                                     'VALUES(?,?,?,?,?,?)', (username, hash_password(password), row['full_name'],
+                                                             row['role'], row['school_id'], iso(now_utc()))).lastrowid
+                except sqlite3.IntegrityError:
+                    raise InputError('Такой логин уже занят, выберите другой') from None
+            db.execute('UPDATE invites SET used_at=?, user_id=? WHERE id=?', (iso(now_utc()), uid, row['id']))
+            user = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+            self._audit(db, dict(user), user['school_id'], 'invite.accept', user['username'])
+            return self._public_user(user)
+
+    # ------------------------------------------------------------------ applications from schools (public form)
+    def submit_application(self, payload, ip=''):
+        if payload.get('website'):  # honeypot field, invisible to humans
+            return {'ok': True}
+        school_name = require_text(payload.get('school_name'), 'Название школы', 120)
+        contact = require_text(payload.get('contact_name'), 'Контактное лицо', 120)
+        city = require_text(payload.get('city', ''), 'Город', 80, allow_empty=True)
+        phone = require_text(payload.get('phone', ''), 'Телефон', 20, allow_empty=True)
+        email = require_text(payload.get('email', ''), 'E-mail', 200, allow_empty=True)
+        if not phone and not email:
+            raise InputError('Укажите телефон или e-mail для связи')
+        if phone and not PHONE_RE.fullmatch(phone):
+            raise InputError('Телефон: только цифры, +, пробелы и скобки')
+        if email and not EMAIL_RE.fullmatch(email):
+            raise InputError('Некорректный e-mail')
+        estimate = payload.get('students_estimate')
+        estimate = None if estimate in (None, '') else require_int(estimate, 'Количество учеников', 1, 20000)
+        message = require_text(payload.get('message', ''), 'Комментарий', 1000, allow_empty=True)
+        with self.connect() as db:
+            if db.execute("SELECT COUNT(*) FROM applications WHERE status='new'").fetchone()[0] >= 500:
+                raise InputError('Слишком много необработанных заявок, попробуйте позже')
+            db.execute('INSERT INTO applications(school_name,city,contact_name,phone,email,students_estimate,message,ip,created_at) '
+                       'VALUES(?,?,?,?,?,?,?,?,?)', (school_name, city, contact, phone, email, estimate, message, ip[:64], iso(now_utc())))
+        return {'ok': True}
+
+    def list_applications(self):
+        with self.connect() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM applications ORDER BY status=\'new\' DESC, id DESC LIMIT 300')]
+
+    def decide_application(self, aid, decision, actor):
+        if decision not in ('approve', 'reject'):
+            raise InputError('decision: approve или reject')
+        with self.connect() as db:
+            app = db.execute("SELECT * FROM applications WHERE id=? AND status='new'", (aid,)).fetchone()
+            if app is None:
+                raise NotFound('Заявка не найдена или уже обработана')
+        if decision == 'reject':
+            with self.connect() as db:
+                db.execute("UPDATE applications SET status='rejected', decided_at=? WHERE id=?", (iso(now_utc()), aid))
+                self._audit(db, actor, None, 'application.reject', app['school_name'])
+            return {'ok': True}
+        name = app['school_name']
+        existing = {s['name'] for s in self.list_schools()}
+        if name in existing:
+            name = f"{name} ({app['city'] or aid})"
+        school = self.create_school({'name': name, 'city': app['city']}, actor)
+        invite = self.create_invite({'role': 'school_admin', 'school_id': school['id'], 'full_name': app['contact_name']}, actor)
+        with self.connect() as db:
+            db.execute("UPDATE applications SET status='approved', decided_at=?, school_id=? WHERE id=?",
+                       (iso(now_utc()), school['id'], aid))
+            self._audit(db, actor, school['id'], 'application.approve', name)
+        return {'school': school, 'invite': invite, 'contact': {k: app[k] for k in ('contact_name', 'phone', 'email')}}
+
+    # ------------------------------------------------------------------ bulk import
+    def import_students(self, sid, rows, actor=None, dry_run=True, consent=False):
+        """rows: parsed table rows [{'row', 'code', 'full_name', 'class'}].
+        Existing code -> update name/class; new -> create (code generated if empty); classes auto-created."""
+        if not dry_run and consent is not True:
+            raise InputError('Подтвердите, что согласия родителей на обработку фото получены')
+        with self.connect() as db:
+            self._school(db, sid)
+            classes = {r['name']: r['id'] for r in db.execute('SELECT id,name FROM classes WHERE school_id=?', (sid,))}
+            students = {r['code']: dict(r) for r in db.execute('SELECT id,code,full_name,class_id FROM students WHERE school_id=?', (sid,))}
+            used_codes = set(students)
+            seq = db.execute('SELECT COUNT(*) FROM students WHERE school_id=?', (sid,)).fetchone()[0]
+        plan, errors, seen = [], [], set()
+        new_classes = sorted({r['class'] for r in rows if r['class'] not in classes})
+        for r in rows:
+            code = r['code']
+            if code is not None and not CODE_RE.fullmatch(code):
+                errors.append({'row': r['row'], 'error': f'код «{code[:30]}»: только латиница, цифры, _ - .'})
+                continue
+            if not code:
+                while True:
+                    seq += 1
+                    code = f'S{sid}-{seq:05d}'
+                    if code not in used_codes:
+                        break
+            if code in seen:
+                errors.append({'row': r['row'], 'error': f'код {code} повторяется в файле'})
+                continue
+            seen.add(code)
+            used_codes.add(code)
+            current = students.get(code)
+            if current is None:
+                action = 'create'
+            elif current['full_name'] == r['full_name'] and classes.get(r['class']) == current['class_id']:
+                action = 'same'
+            else:
+                action = 'update'
+            plan.append({**r, 'code': code, 'action': action})
+        summary = {'create': sum(p['action'] == 'create' for p in plan), 'update': sum(p['action'] == 'update' for p in plan),
+                   'same': sum(p['action'] == 'same' for p in plan), 'new_classes': new_classes, 'errors': errors,
+                   'preview': plan[:100], 'total': len(plan)}
+        if dry_run:
+            return summary
+        with self.connect() as db:
+            for name in new_classes:
+                classes[name] = db.execute('INSERT INTO classes(school_id,name,created_at) VALUES(?,?,?)',
+                                           (sid, name, iso(now_utc()))).lastrowid
+            for p in plan:
+                if p['action'] == 'create':
+                    db.execute('INSERT INTO students(school_id,class_id,code,full_name,consent_at,created_at) VALUES(?,?,?,?,?,?)',
+                               (sid, classes[p['class']], p['code'], p['full_name'], iso(now_utc()), iso(now_utc())))
+                elif p['action'] == 'update':
+                    db.execute('UPDATE students SET full_name=?, class_id=? WHERE school_id=? AND code=?',
+                               (p['full_name'], classes[p['class']], sid, p['code']))
+            self._audit(db, actor, sid, 'student.import',
+                        f"create={summary['create']} update={summary['update']} classes={len(new_classes)}")
+        summary['applied'] = True
+        return summary
+
+    def import_photos(self, sid, entries, actor=None):
+        """entries: iterable of (student_code, bytes|None, member_name). Never aborts on one bad file."""
+        with self.connect() as db:
+            self._school(db, sid)
+            by_code = {r['code']: r['id'] for r in db.execute('SELECT id,code FROM students WHERE school_id=?', (sid,))}
+            known = {r['sha256'] for r in db.execute('SELECT sha256 FROM photos WHERE school_id=?', (sid,))}
+        result = {'added': 0, 'duplicates': 0, 'unknown_code': [], 'rejected': []}
+        for code, data, name in entries:
+            if data is None:
+                result['rejected'].append(f'{name}: больше 3 МБ')
+                continue
+            if code not in by_code:
+                result['unknown_code'].append(name)
+                continue
+            if sha256_hex(data) in known:
+                result['duplicates'] += 1
+                continue
+            try:
+                self.add_photo(sid, by_code[code], data, None)
+                known.add(sha256_hex(data))
+                result['added'] += 1
+            except InputError as exc:
+                result['rejected'].append(f'{name}: {exc}')
+        with self.connect() as db:
+            self._audit(db, actor, sid, 'photo.import', f"added={result['added']} rejected={len(result['rejected'])}")
+        result['unknown_code'] = result['unknown_code'][:50]
+        result['rejected'] = result['rejected'][:50]
+        return result
+
+    # ------------------------------------------------------------------ bulk edits
+    def bulk_students(self, sid, payload, actor=None):
+        ids = payload.get('student_ids')
+        if not isinstance(ids, list) or not ids or len(ids) > 2000:
+            raise InputError('Выберите учеников')
+        ids = [require_int(i, 'student_id', 1, 2**31) for i in ids]
+        action = payload.get('action')
+        if action == 'move':
+            cid = require_int(payload.get('class_id'), 'Класс', 1, 2**31)
+            with self.connect() as db:
+                self._class(db, sid, cid)
+                n = db.execute(f'UPDATE students SET class_id=? WHERE school_id=? AND id IN ({",".join("?" * len(ids))})',
+                               (cid, sid, *ids)).rowcount
+                self._audit(db, actor, sid, 'student.bulk_move', f'{n} -> class {cid}')
+            return {'moved': n}
+        if action == 'delete':
+            n = 0
+            for stid in ids:
+                try:
+                    self.delete_student(sid, stid, actor)
+                    n += 1
+                except NotFound:
+                    pass
+            return {'deleted': n}
+        raise InputError('action: move или delete')
+
+    def copy_schedule_day(self, sid, payload, actor=None):
+        """Copy one weekday of a class to other weekdays (replacing them) - typical 'same bells every day' setup."""
+        cid = require_int(payload.get('class_id'), 'Класс', 1, 2**31)
+        src = require_int(payload.get('from_weekday'), 'День-образец', 1, 7)
+        targets = payload.get('to_weekdays')
+        if not isinstance(targets, list) or not targets:
+            raise InputError('Выберите дни для копирования')
+        targets = sorted({require_int(t, 'День', 1, 7) for t in targets} - {src})
+        with self.connect() as db:
+            self._class(db, sid, cid)
+            lessons = db.execute('SELECT start_time,end_time,subject,teacher,camera_id FROM lessons WHERE school_id=? AND class_id=? '
+                                 'AND weekday=?', (sid, cid, src)).fetchall()
+            if not lessons:
+                raise InputError('В выбранном дне нет уроков')
+            for wd in targets:
+                db.execute('DELETE FROM lessons WHERE school_id=? AND class_id=? AND weekday=?', (sid, cid, wd))
+                for l in lessons:
+                    db.execute('INSERT INTO lessons(school_id,class_id,weekday,start_time,end_time,subject,teacher,camera_id,created_at) '
+                               'VALUES(?,?,?,?,?,?,?,?,?)', (sid, cid, wd, l['start_time'], l['end_time'], l['subject'],
+                                                             l['teacher'], l['camera_id'], iso(now_utc())))
+            self._audit(db, actor, sid, 'lesson.copy_day', f'class={cid} {src} -> {targets}')
+        return {'copied_to': targets, 'lessons': len(lessons)}
+
+    # ------------------------------------------------------------------ export
+    STATUS_LETTER = {'present': 'П', 'late': 'О', 'absent': 'Н', 'excused': 'У', 'not_seen': '?', 'no_data': '-',
+                     'needs_review': '?', 'upcoming': '', 'in_progress': ''}
+    STATUS_TEXT = {'present': 'присутствует', 'late': 'опоздал', 'absent': 'отсутствует', 'excused': 'уважительная причина',
+                   'not_seen': 'не замечен', 'no_data': 'нет данных', 'needs_review': 'требует проверки',
+                   'upcoming': 'урок не начался', 'in_progress': 'идёт урок'}
+
+    def export_attendance(self, sid, date_from, date_to, class_id=None):
+        d1, d2 = parse_day(date_from), parse_day(date_to)
+        if d2 < d1 or (d2 - d1).days > 62:
+            raise InputError('Период: не более 62 дней, «с» не позже «по»')
+        class_ids = [class_id] if class_id else [c['id'] for c in self.list_classes(sid)]
+        rows = []
+        d = d1
+        while d <= d2:
+            for cid in class_ids:
+                grid = self.attendance(sid, cid, d.isoformat())
+                for n, lesson in enumerate(grid['lessons'], start=1):
+                    for r in grid['rows']:
+                        c = r['cells'][str(lesson['id'])]
+                        rows.append([d.isoformat(), grid['class']['name'], n, f"{lesson['start_time']}-{lesson['end_time']}",
+                                     lesson['subject'], r['student']['code'], r['student']['full_name'],
+                                     self.STATUS_LETTER.get(c['status'], ''), self.STATUS_TEXT.get(c['status'], c['status']),
+                                     {'manual': 'учитель', 'ai': 'камера', 'entry': 'вход/СКУД'}.get(c.get('source'), ''),
+                                     c.get('first_seen', '') and from_iso(c['first_seen']).astimezone(TZ).strftime('%H:%M')])
+            d += timedelta(days=1)
+        header = ['Дата', 'Класс', 'Урок №', 'Время', 'Предмет', 'Код ученика', 'Ученик', 'Отметка', 'Статус', 'Источник', 'Замечен в']
+        return header, rows
