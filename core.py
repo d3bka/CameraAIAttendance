@@ -43,6 +43,7 @@ EVENT_TYPES = ('motion', 'device_event', 'access_granted', 'access_denied', 'fac
 METHODS = ('none', 'card', 'device_face', 'ai_face')
 PHOTO_STATUSES = ('unchecked', 'ok', 'no_face', 'multiple_faces', 'too_small', 'unreadable', 'demo')
 MAX_PHOTOS_PER_STUDENT = 5
+MAX_AUTO_PHOTOS = 3  # camera-learned references per student (rotating)
 MAX_PHOTO_BYTES = 3 * 1024 * 1024
 SESSION_TTL = timedelta(hours=12)
 LOCK_AFTER_FAILURES = 5
@@ -235,6 +236,7 @@ CREATE TABLE IF NOT EXISTS schools (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT NOT NULL DEFAULT '',
     late_grace_min INTEGER NOT NULL DEFAULT 10,
     auto_absent INTEGER NOT NULL DEFAULT 1,
+    auto_learn INTEGER NOT NULL DEFAULT 1,
     face_auto_threshold REAL NOT NULL DEFAULT 0.45,
     face_review_threshold REAL NOT NULL DEFAULT 0.363,
     created_at TEXT NOT NULL
@@ -266,7 +268,7 @@ CREATE TABLE IF NOT EXISTS photos (
     id INTEGER PRIMARY KEY, school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
     file_name TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL,
-    face_status TEXT NOT NULL DEFAULT 'unchecked', created_at TEXT NOT NULL
+    face_status TEXT NOT NULL DEFAULT 'unchecked', source TEXT NOT NULL DEFAULT 'manual', created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS cameras (
     id INTEGER PRIMARY KEY, school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
@@ -415,6 +417,11 @@ class Store:
             school_cols = {r['name'] for r in db.execute('PRAGMA table_info(schools)')}
             if 'auto_absent' not in school_cols:
                 db.execute('ALTER TABLE schools ADD COLUMN auto_absent INTEGER NOT NULL DEFAULT 1')
+            if 'auto_learn' not in school_cols:
+                db.execute('ALTER TABLE schools ADD COLUMN auto_learn INTEGER NOT NULL DEFAULT 1')
+            photo_cols = {r['name'] for r in db.execute('PRAGMA table_info(photos)')}
+            if 'source' not in photo_cols:
+                db.execute("ALTER TABLE photos ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
             event_cols = {r['name'] for r in db.execute('PRAGMA table_info(events)')}
             if 'second_score' not in event_cols:
                 db.execute('ALTER TABLE events ADD COLUMN second_score REAL')
@@ -465,7 +472,7 @@ class Store:
 
     def _school_fields(self, payload, current=None):
         cur = current or {'late_grace_min': 10, 'face_auto_threshold': 0.45, 'face_review_threshold': 0.363, 'city': '',
-                          'auto_absent': 1}
+                          'auto_absent': 1, 'auto_learn': 1}
         name = require_text(payload['name'], 'Название', 120) if 'name' in payload else cur.get('name')
         if name is None:
             raise InputError('Название обязательно')
@@ -478,14 +485,18 @@ class Store:
         auto_absent = payload.get('auto_absent', cur['auto_absent'])
         if auto_absent not in (True, False, 0, 1):
             raise InputError('auto_absent: true или false')
-        return name, city, grace, auto, review, int(auto_absent)
+        auto_learn = payload.get('auto_learn', cur.get('auto_learn', 1))
+        if auto_learn not in (True, False, 0, 1):
+            raise InputError('auto_learn: true или false')
+        return name, city, grace, auto, review, int(auto_absent), int(auto_learn)
 
     def create_school(self, payload, actor=None):
-        name, city, grace, auto, review, auto_absent = self._school_fields(payload)
+        name, city, grace, auto, review, auto_absent, auto_learn = self._school_fields(payload)
         with self.connect() as db:
             try:
-                cur = db.execute('INSERT INTO schools(name,city,late_grace_min,auto_absent,face_auto_threshold,face_review_threshold,'
-                                 'created_at) VALUES(?,?,?,?,?,?,?)', (name, city, grace, auto_absent, auto, review, iso(now_utc())))
+                cur = db.execute('INSERT INTO schools(name,city,late_grace_min,auto_absent,auto_learn,face_auto_threshold,'
+                                 'face_review_threshold,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                                 (name, city, grace, auto_absent, auto_learn, auto, review, iso(now_utc())))
             except sqlite3.IntegrityError:
                 raise InputError('Школа с таким названием уже существует') from None
             sid = cur.lastrowid
@@ -495,10 +506,10 @@ class Store:
     def update_school(self, sid, payload, actor=None):
         with self.connect() as db:
             current = self._school(db, sid)
-            name, city, grace, auto, review, auto_absent = self._school_fields(payload, current)
+            name, city, grace, auto, review, auto_absent, auto_learn = self._school_fields(payload, current)
             try:
-                db.execute('UPDATE schools SET name=?,city=?,late_grace_min=?,auto_absent=?,face_auto_threshold=?,face_review_threshold=? '
-                           'WHERE id=?', (name, city, grace, auto_absent, auto, review, sid))
+                db.execute('UPDATE schools SET name=?,city=?,late_grace_min=?,auto_absent=?,auto_learn=?,face_auto_threshold=?,'
+                           'face_review_threshold=? WHERE id=?', (name, city, grace, auto_absent, auto_learn, auto, review, sid))
             except sqlite3.IntegrityError:
                 raise InputError('Школа с таким названием уже существует') from None
             self._audit(db, actor, sid, 'school.update', f'grace={grace} auto={auto} review={review} auto_absent={auto_absent}')
@@ -788,8 +799,8 @@ class Store:
                                   (sid, class_id))
             students = [dict(r) for r in rows]
             photos = {}
-            for p in db.execute('SELECT id,student_id,face_status FROM photos WHERE school_id=? ORDER BY id', (sid,)):
-                photos.setdefault(p['student_id'], []).append({'id': p['id'], 'face_status': p['face_status']})
+            for p in db.execute('SELECT id,student_id,face_status,source FROM photos WHERE school_id=? ORDER BY id', (sid,)):
+                photos.setdefault(p['student_id'], []).append({'id': p['id'], 'face_status': p['face_status'], 'source': p['source']})
         for s in students:
             s['photos'] = photos.get(s['id'], [])
             s['ai_ready'] = any(p['face_status'] == 'ok' for p in s['photos'])
@@ -859,7 +870,7 @@ class Store:
         except (OSError, NotFound):
             pass
 
-    def add_photo(self, sid, stid, data: bytes, actor=None, face_status='unchecked'):
+    def add_photo(self, sid, stid, data: bytes, actor=None, face_status='unchecked', source='manual'):
         if not isinstance(data, (bytes, bytearray)) or not data:
             raise InputError('Пустой файл')
         if len(data) > MAX_PHOTO_BYTES:
@@ -873,21 +884,21 @@ class Store:
         path = self._photo_path(sid, file_name)
         with self.connect() as db:
             self._student(db, sid, stid)
-            count = db.execute('SELECT COUNT(*) FROM photos WHERE student_id=?', (stid,)).fetchone()[0]
-            if count >= MAX_PHOTOS_PER_STUDENT:
+            count = db.execute('SELECT COUNT(*) FROM photos WHERE student_id=? AND source=?', (stid, source)).fetchone()[0]
+            if count >= (MAX_PHOTOS_PER_STUDENT if source == 'manual' else MAX_AUTO_PHOTOS):
                 raise InputError(f'Не более {MAX_PHOTOS_PER_STUDENT} фото на ученика')
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix('.tmp')
             tmp.write_bytes(bytes(data))
             try:
-                cur = db.execute('INSERT INTO photos(school_id,student_id,file_name,sha256,mime,size,face_status,created_at) '
-                                 'VALUES(?,?,?,?,?,?,?,?)',
-                                 (sid, stid, file_name, sha256_hex(bytes(data)), mime, len(data), face_status, iso(now_utc())))
+                cur = db.execute('INSERT INTO photos(school_id,student_id,file_name,sha256,mime,size,face_status,source,created_at) '
+                                 'VALUES(?,?,?,?,?,?,?,?,?)',
+                                 (sid, stid, file_name, sha256_hex(bytes(data)), mime, len(data), face_status, source, iso(now_utc())))
                 tmp.replace(path)
             except Exception:
                 tmp.unlink(missing_ok=True)
                 raise
-            self._audit(db, actor, sid, 'photo.add', f'student={stid}')
+            self._audit(db, actor, sid, 'photo.add' if source == 'manual' else 'photo.auto_learn', f'student={stid}')
             return {'id': cur.lastrowid, 'face_status': face_status}
 
     def delete_photo(self, sid, pid, actor=None):
@@ -928,7 +939,7 @@ class Store:
                 photos.setdefault(p['student_id'], []).append({'id': p['id'], 'sha256': p['sha256'], 'face_status': p['face_status']})
         for s in students:
             s['photos'] = photos.get(s['id'], [])
-        return {'school_id': sid, 'face_auto_threshold': school['face_auto_threshold'],
+        return {'school_id': sid, 'auto_learn': bool(school['auto_learn']), 'face_auto_threshold': school['face_auto_threshold'],
                 'face_review_threshold': school['face_review_threshold'],
                 'students': [s for s in students if s['photos']]}
 
@@ -1852,3 +1863,24 @@ class Store:
     def tg_unmark_sent(self, key):
         with self.connect() as db:
             db.execute('DELETE FROM tg_sent WHERE key=?', (key,))
+
+    # ------------------------------------------------------------------ self-learning from classroom cameras
+    def add_auto_photo(self, sid, code, data: bytes):
+        """Head crop of a confidently recognised child, sent by the AI worker. Rotating, at most one per day."""
+        code = require_code(code, 'code')
+        today = datetime.now(TZ).date().isoformat()
+        with self.connect() as db:
+            school = self._school(db, sid)
+            if not school['auto_learn']:
+                return {'stored': False, 'reason': 'disabled'}
+            st = db.execute('SELECT id FROM students WHERE school_id=? AND code=?', (sid, code)).fetchone()
+            if st is None:
+                raise NotFound('Ученик не найден')
+            autos = db.execute("SELECT id, file_name, created_at FROM photos WHERE student_id=? AND source='auto' ORDER BY id",
+                               (st['id'],)).fetchall()
+            if any(from_iso(a['created_at']).astimezone(TZ).date().isoformat() == today for a in autos):
+                return {'stored': False, 'reason': 'already_today'}
+        if len(autos) >= MAX_AUTO_PHOTOS:  # rotate: forget the oldest camera-learned photo
+            self.delete_photo(sid, autos[0]['id'])
+        res = self.add_photo(sid, st['id'], data, {'username': 'ai-worker'}, source='auto')
+        return {'stored': True, 'id': res['id']}

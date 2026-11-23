@@ -804,6 +804,11 @@ def worker_photo(h, pid):
     h.send_bytes(path.read_bytes(), mime, csp="default-src 'none'", cache='no-store')
 
 
+@route('POST', r'/api/worker/auto-photo', 'token', limit=2 * 1024 * 1024)
+def worker_auto_photo(h):
+    return h.server.store.add_auto_photo(h.token_sid, h.body.get('code'), _decode_upload(h))
+
+
 @route('POST', r'/api/worker/photos/(\d{1,9})/quality', 'token')
 def worker_photo_quality(h, pid):
     return h.server.store.set_photo_quality(h.token_sid, pid, h.body.get('face_status'))

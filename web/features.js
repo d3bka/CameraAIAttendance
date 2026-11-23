@@ -286,12 +286,13 @@ pages.students = async () => {
       isAdmin() ? h('td', { class: 'check-cell' }, check) : null,
       h('td', {}, h('strong', {}, s.full_name), h('div', { class: 'device-meta' }, `${s.code}${classId === 'all' ? ' · ' + s.class_name : ''}`)),
       h('td', {}, h('div', { class: 'thumbs' }, s.photos.map(p => h('div', { class: 'thumb' },
-        h('img', { src: photoUrl(p.id), alt: 'фото', loading: 'lazy' }), tag(...PHOTO_STATUS[p.face_status] || [p.face_status, 'dim']),
+        h('img', { src: photoUrl(p.id), alt: 'фото', loading: 'lazy' }),
+        p.source === 'auto' ? tag('авто · с камеры', 'info') : tag(...PHOTO_STATUS[p.face_status] || [p.face_status, 'dim']),
         isAdmin() ? h('button', { class: 'x-btn', type: 'button', title: 'Удалить фото', onclick: async () => {
           if (!await confirmDialog('Удалить это фото?')) return;
           try { await api(sPath('/photos/' + p.id), 'DELETE'); toast('Фото удалено'); refresh(); } catch (e) { toast(e.message, true); }
         } }, '×') : null)),
-      isAdmin() && s.photos.length < 5 ? uploadButton(s) : null)),
+      isAdmin() && s.photos.filter(x => x.source !== 'auto').length < 5 ? uploadButton(s) : null)),
       h('td', {}, s.ai_ready ? tag('Готов', 'good') : s.photos.some(p => p.face_status === 'unchecked') ? tag('Ждёт проверки AI', 'dim') : tag('Нужны фото', 'bad')),
       tg.bot_enabled ? h('td', {}, tg.parents[s.id] ? tag(`подписано: ${tg.parents[s.id]}`, 'good') : tag('нет', 'dim'), ' ',
         h('button', { class: 'mini-btn neutral', type: 'button', title: 'Личная ссылка для родителей', onclick: () => parentLink(s) }, '🔗')) : null,

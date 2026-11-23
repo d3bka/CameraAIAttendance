@@ -164,6 +164,29 @@ class PhotoTests(Base):
         self.store.delete_school(self.a)
         self.assertFalse((self.store.photo_dir / str(self.a)).exists())
 
+    def test_auto_learned_photos(self):
+        sid = self.students['S1']
+        for i in range(core.MAX_PHOTOS_PER_STUDENT):
+            self.store.add_photo(self.a, sid, synthetic_avatar(f'm{i}'))      # manual quota full ...
+        r = self.store.add_auto_photo(self.a, 'S1', synthetic_avatar('auto0'))
+        self.assertTrue(r['stored'])                                          # ... camera-learned photos have their own
+        self.assertEqual(self.store.add_auto_photo(self.a, 'S1', synthetic_avatar('auto1'))['reason'], 'already_today')
+        with self.store.connect() as db:                                      # pretend earlier days
+            db.execute("UPDATE photos SET created_at='2026-01-01T08:00:00+00:00' WHERE source='auto'")
+        for i in range(1, 4):
+            self.assertTrue(self.store.add_auto_photo(self.a, 'S1', synthetic_avatar(f'auto{i}'))['stored'])
+            with self.store.connect() as db:
+                db.execute("UPDATE photos SET created_at='2026-01-01T08:00:00+00:00' WHERE source='auto'")
+        autos = [p for p in self.store.list_students(self.a)[0]['photos'] if p['source'] == 'auto']
+        self.assertEqual(len(autos), core.MAX_AUTO_PHOTOS)                     # rotated, never grows
+        self.assertNotIn(r['id'], [p['id'] for p in autos])                   # the oldest one was replaced
+        files = list((self.store.photo_dir / str(self.a)).iterdir())
+        self.assertEqual(len(files), core.MAX_PHOTOS_PER_STUDENT + core.MAX_AUTO_PHOTOS)
+        self.store.update_school(self.a, {'auto_learn': False}, SUPER)
+        self.assertEqual(self.store.add_auto_photo(self.a, 'S1', synthetic_avatar('x'))['reason'], 'disabled')
+        with self.assertRaises(NotFound):
+            self.store.add_auto_photo(self.b, 'S1', synthetic_avatar('y'))   # other school's token
+
     def test_quality_status(self):
         pid = self.store.add_photo(self.a, self.students['S1'], synthetic_avatar('q'))['id']
         self.store.set_photo_quality(self.a, pid, 'ok')

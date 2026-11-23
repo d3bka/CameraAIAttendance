@@ -460,7 +460,7 @@ pages.students = async () => {
 function uploadButton(student) {
   const file = h('input', { type: 'file', accept: 'image/jpeg,image/png', multiple: true, hidden: true });
   file.addEventListener('change', async () => {
-    const files = [...file.files].slice(0, 5 - student.photos.length);
+    const files = [...file.files].slice(0, 5 - student.photos.filter(x => x.source !== 'auto').length);
     let done = 0;
     for (const f of files) {
       try { await api(sPath(`/students/${student.id}/photos`), 'POST', { data_base64: await prepareImage(f) }); done++; }
@@ -533,9 +533,11 @@ pages.cameras = async () => {
     field('На проверку учителю при уверенности от', input('face_review_threshold', { type: 'number', step: '0.01', min: 0.2, max: 0.95, value: school.face_review_threshold })),
     h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'auto_absent', checked: !!school.auto_absent }),
       h('span', {}, 'Автоматически ставить «Отсутствует», если камера работала весь урок, а ребёнка не было в кадре')),
+    h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'auto_learn', checked: school.auto_learn !== 0 }),
+      h('span', {}, 'Самообучение: AI сам добавляет до 3 удачных кадров ребёнка с камеры, когда уверенно его узнал (точность растёт со временем)')),
     h('button', { class: 'btn primary', type: 'submit' }, 'Сохранить')), async data => {
     await api(`/api/s/${state.sid}`, 'PUT', { late_grace_min: Number(data.late_grace_min), face_auto_threshold: Number(data.face_auto_threshold),
-      face_review_threshold: Number(data.face_review_threshold), auto_absent: data.auto_absent });
+      face_review_threshold: Number(data.face_review_threshold), auto_absent: data.auto_absent, auto_learn: data.auto_learn });
     toast('Настройки сохранены');
   }) : null;
   return h('div', {}, heading('DEVICES & AI', 'Камеры и распознавание', 'Каждая камера в классе обслуживается AI-воркером, который шлёт распознавания и сигнал «я работаю» раз в минуту.'),

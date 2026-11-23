@@ -20,11 +20,16 @@ from __future__ import annotations
 
 import argparse
 import collections
+import base64
 import hashlib
+import ipaddress
 import json
 import logging
+import re
 import os
+import socket
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -60,6 +65,11 @@ VERIFIER = ('w600k_r50.onnx', 'https://github.com/deepinsight/insightface/releas
             '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43')
 VERIFIER_ACCEPT = 0.40   # ArcFace cosine: same person with high probability
 VERIFIER_REJECT = 0.20   # ArcFace cosine: almost certainly a different person -> veto
+LEARN_MIN_SCORE = 0.55       # self-learning: main model must be confident ...
+LEARN_MIN_SECOND = 0.50      # ... and the second model must agree
+LEARN_MAX_SIMILARITY = 0.85  # skip views that are almost identical to existing references
+LEARN_MIN_FACE = 80
+LEARN_MIN_SHARPNESS = 40.0
 
 
 def redact(url: str) -> str:
@@ -68,6 +78,94 @@ def redact(url: str) -> str:
         return f'{parts.scheme}://{parts.hostname or "?"}{":" + str(parts.port) if parts.port else ""}{parts.path}'
     except ValueError:
         return '<source>'
+
+
+MAC_RE = re.compile(r'([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}')
+
+
+def camera_ip(source):
+    """IPv4 address of an RTSP camera on a private network, else None (webcams/files are not pinned)."""
+    try:
+        host = urlsplit(str(source)).hostname
+        ip = ipaddress.ip_address(socket.gethostbyname(host)) if host else None
+    except (ValueError, OSError):
+        return None
+    return str(ip) if ip and ip.version == 4 and ip.is_private else None
+
+
+def arp_mac(ip, port=554):
+    """MAC address of `ip` from the OS ARP cache, after a bare TCP probe (no data, no credentials)."""
+    try:
+        with socket.create_connection((ip, port), timeout=2):
+            pass
+    except OSError:
+        return None
+    try:
+        if os.name == 'nt':
+            out = subprocess.run(['arp', '-a', ip], capture_output=True, timeout=5).stdout.decode('ascii', 'ignore')
+            line = next((l for l in out.splitlines() if l.split()[:1] == [ip]), '')
+        else:
+            line = next((l for l in Path('/proc/net/arp').read_text().splitlines() if l.split()[:1] == [ip]), '')
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = MAC_RE.search(line)
+    return m.group(0).lower().replace('-', ':') if m else None
+
+
+class CameraPins:
+    """Trust-on-first-use: remember each camera's MAC address and never send its password to another device.
+
+    Protects RTSP credentials when the worker PC moves to another network where the same IP belongs
+    to someone else (the RTSP client may otherwise hand the password to that device)."""
+
+    def __init__(self, path: Path, enabled=True, mac_lookup=arp_mac):
+        self.path, self.enabled, self.mac_lookup = Path(path), enabled, mac_lookup
+        self.lock = threading.Lock()
+        try:
+            self.pins = json.loads(self.path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            self.pins = {}
+        self.warned: dict[str, float] = {}
+
+    def verify(self, camera_key, source):
+        ip = camera_ip(source)
+        if not self.enabled or ip is None:
+            return True
+        port = urlsplit(str(source)).port or 554
+        mac = self.mac_lookup(ip, port)
+        with self.lock:
+            pinned = self.pins.get(camera_key, {}).get('mac')
+            if mac is None:
+                self._warn(camera_key, f'camera {ip} not reachable; not sending credentials')
+                return False
+            if pinned is None:
+                self.pins[camera_key] = {'mac': mac, 'ip': ip, 'pinned_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+                self._save()
+                LOG.info('[%s] camera identity pinned (MAC %s)', camera_key, mac)
+                return True
+            if pinned != mac:
+                self._warn(camera_key, f'IDENTITY MISMATCH: {ip} is {mac}, expected {pinned}. Wrong network or replaced camera - '
+                                       f'credentials NOT sent. If the camera was replaced: python face_worker.py --reset-pin {camera_key}')
+                return False
+            return True
+
+    def reset(self, camera_key):
+        with self.lock:
+            removed = self.pins.pop(camera_key, None) is not None
+            self._save()
+        return removed
+
+    def _warn(self, key, message):
+        now = time.monotonic()
+        if now - self.warned.get(key, -1e9) > 300:
+            self.warned[key] = now
+            LOG.warning('[%s] %s', key, message)
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.pins, indent=2), encoding='utf-8')
+        tmp.replace(self.path)
 
 
 def file_sha256(path: Path) -> str:
@@ -285,8 +383,9 @@ class Confirmer:
 class FrameGrabber(threading.Thread):
     """Continuously reads the stream and keeps only the newest frame (no RTSP lag on slow CPUs)."""
 
-    def __init__(self, source):
+    def __init__(self, source, guard=None):
         super().__init__(daemon=True)
+        self.guard = guard  # callable -> bool; checked before every (re)connect
         self.source = int(source) if str(source).isdigit() else source
         self.is_file = isinstance(self.source, str) and Path(self.source).is_file()
         self.lock = threading.Lock()
@@ -301,6 +400,9 @@ class FrameGrabber(threading.Thread):
 
     def run(self):
         while not self.stop.is_set():
+            if self.guard is not None and not self.guard():
+                self.stop.wait(30)
+                continue
             cap = cv2.VideoCapture(self.source)
             if not cap.isOpened():
                 LOG.warning('Cannot open video source; retrying in 5 s')
@@ -360,6 +462,14 @@ class Platform:
         except requests.RequestException:
             pass
 
+    def auto_photo(self, code, jpeg_bytes):
+        try:
+            r = self.session.post(self.api + '/api/worker/auto-photo', timeout=15,
+                                  json={'code': code, 'data_base64': base64.b64encode(jpeg_bytes).decode('ascii')})
+            return r.status_code == 200 and r.json().get('stored')
+        except (requests.RequestException, ValueError):
+            return False
+
     def heartbeat(self, ok, stats, idle=False):
         try:
             r = self.session.post(self.api + '/api/worker/heartbeat',
@@ -405,6 +515,9 @@ class SharedGallery:
         self.gallery = Gallery()
         self.review_threshold = 0.363
         self.verifier: Verifier | None = None
+        self.pins: CameraPins | None = None
+        self.auto_learn = False
+        self.learned: dict[str, str] = {}  # student code -> date of the last camera-learned photo
 
     def match(self, feature, margin):
         with self.lock:
@@ -447,6 +560,7 @@ def sync_gallery(engine: FaceEngine, platform: Platform, shared: SharedGallery, 
     with shared.lock:
         shared.gallery = fresh
         shared.review_threshold = roster['face_review_threshold']
+        shared.auto_learn = bool(roster.get('auto_learn')) and not getattr(shared, 'auto_learn_disabled', False)
     LOG.info('Gallery: %d template(s) for %d student(s)', len(fresh.codes), fresh.students)
     return roster
 
@@ -516,7 +630,8 @@ class CameraWorker(threading.Thread):
                 active = self.schedule.active(self.camera_key)
                 if active and grabber is None:
                     LOG.info('[%s] lesson window open -> connecting to %s', self.camera_key, src_label)
-                    grabber = FrameGrabber(self.source)
+                    guard = (lambda: self.shared.pins.verify(self.camera_key, self.source)) if self.shared.pins else None
+                    grabber = FrameGrabber(self.source, guard=guard)
                     grabber.start()
                     last_frames = 0
                 elif not active and grabber is not None:
@@ -583,6 +698,7 @@ class CameraWorker(threading.Thread):
             if confirmed is not None:
                 self.stats['matches'] += 1
                 self.platform.send_match(code, *confirmed)
+                self.maybe_learn(code, score, second, frame, face, crop)
         if args.show:
             preview = frame.copy()
             for face in faces:
@@ -591,6 +707,26 @@ class CameraWorker(threading.Thread):
             cv2.imshow(f'{self.camera_key} (q = quit)', preview)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
+
+    def maybe_learn(self, code, score, second, frame, face, aligned):
+        """Add a new reference photo only when we are sure who it is AND the view adds information."""
+        today = datetime.now().date().isoformat()
+        sure = score >= LEARN_MIN_SCORE and (self.shared.verifier is None or (second is not None and second >= LEARN_MIN_SECOND))
+        novel = score < LEARN_MAX_SIMILARITY  # near-duplicates of existing references teach nothing
+        if not (self.shared.auto_learn and sure and novel) or self.shared.learned.get(code) == today:
+            return False
+        if face[2] < LEARN_MIN_FACE or blur_score(aligned) < LEARN_MIN_SHARPNESS:
+            return False
+        x, y, w, h = face[:4]
+        m = 0.6
+        x0, y0 = int(max(0, x - w * m)), int(max(0, y - h * m))
+        x1, y1 = int(min(frame.shape[1], x + w * (1 + m))), int(min(frame.shape[0], y + h * (1 + m)))
+        ok, jpg = cv2.imencode('.jpg', frame[y0:y1, x0:x1], [cv2.IMWRITE_JPEG_QUALITY, 90])
+        self.shared.learned[code] = today  # at most one attempt per child per day, even if the upload fails
+        if ok and self.platform.auto_photo(code, jpg.tobytes()):
+            LOG.info('[%s] learned a new reference view of %s (score %.2f)', self.camera_key, code, score)
+            return True
+        return False
 
     def heartbeat_stats(self, elapsed, frames):
         with self.shared.lock:
@@ -625,6 +761,10 @@ def load_cameras(args):
     return ({args.camera_key: source} if args.camera_key else {}), os.environ.get('ATTENDANCE_INGEST_TOKEN')
 
 
+def pins_path(args):
+    return (Path(args.config).resolve().parent if args.config else ROOT / 'data') / 'camera_pins.json'
+
+
 def run(args):
     cameras, token = load_cameras(args)
     if not token:
@@ -634,7 +774,17 @@ def run(args):
     control = Platform(args.api, token, 'control')
     shared = SharedGallery()
     shared.verifier = load_verifier(Path(args.models_dir), args.verifier, args.download_verifier, args.no_verifier)
-    sync_gallery(engine, control, shared, args.enroll_min_face)
+    shared.pins = CameraPins(pins_path(args), enabled=not args.no_pin)
+    shared.auto_learn_disabled = args.no_auto_learn
+    while True:  # the platform may still be starting (e.g. both launched at Windows logon)
+        try:
+            sync_gallery(engine, control, shared, args.enroll_min_face)
+            break
+        except requests.RequestException as exc:
+            if args.check_photos:
+                raise
+            LOG.warning('Platform not reachable yet (%s); retrying in 10 s', type(exc).__name__)
+            time.sleep(10)
     if args.check_photos:
         LOG.info('Photo check finished; see statuses in the admin panel')
         return
@@ -707,8 +857,15 @@ def main(argv=None):
     parser.add_argument('--verifier', help='Path to a second-opinion 512-d ONNX face model (default: models/w600k_r50.onnx)')
     parser.add_argument('--download-verifier', action='store_true', help='Download ArcFace R50 (InsightFace, non-commercial licence)')
     parser.add_argument('--no-verifier', action='store_true', help='Disable the second-opinion model')
+    parser.add_argument('--no-auto-learn', action='store_true', help='Do not add camera-learned reference photos')
+    parser.add_argument('--no-pin', action='store_true', help='Do not verify camera identity (MAC) before sending credentials')
+    parser.add_argument('--reset-pin', metavar='CAMERA_KEY', help='Forget the remembered identity of a replaced camera')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if args.reset_pin:
+        removed = CameraPins(pins_path(args)).reset(args.reset_pin)
+        LOG.info('Pin for %s %s', args.reset_pin, 'removed' if removed else 'was not set')
+        return
     if (args.download_models or args.download_verifier) and not (args.camera_key or args.config):
         if args.download_models:
             ensure_models(Path(args.models_dir), download=True)

@@ -61,6 +61,55 @@ class FaceWorkerLogicTest(unittest.TestCase):
             self.assertIsNone(fw.load_verifier(Path(tmp)))                  # not installed -> worker runs without it
             self.assertIsNone(fw.load_verifier(Path(tmp), disabled=True))
 
+    def test_camera_identity_pinning(self):
+        import tempfile
+        macs = {'mac': 'aa:bb:cc:00:11:22'}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'pins.json'
+            pins = fw.CameraPins(path, mac_lookup=lambda ip, port: macs['mac'])
+            url = 'rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/101'
+            self.assertTrue(pins.verify('room', url))                      # first use: pinned
+            self.assertTrue(fw.CameraPins(path, mac_lookup=lambda ip, port: macs['mac']).verify('room', url))  # persisted
+            macs['mac'] = '11:22:33:44:55:66'                             # same IP, other network/device
+            self.assertFalse(pins.verify('room', url))
+            macs['mac'] = None                                            # unreachable -> do not send credentials
+            self.assertFalse(pins.verify('room', url))
+            self.assertTrue(pins.verify('webcam', '0'))                   # local webcam / files are not pinned
+            self.assertTrue(fw.CameraPins(path, enabled=False, mac_lookup=lambda ip, port: None).verify('room', url))
+            self.assertTrue(pins.reset('room'))
+            macs['mac'] = '11:22:33:44:55:66'
+            self.assertTrue(pins.verify('room', url))                     # re-pinned after a deliberate reset
+        self.assertIsNone(fw.camera_ip('rtsp://u:p@8.8.8.8/x'))           # public addresses are never treated as LAN cameras
+
+    def test_self_learning_rules(self):
+        class FakePlatform:
+            uploads = []
+
+            def auto_photo(self, code, data):
+                self.uploads.append(code)
+                return True
+        shared = fw.SharedGallery()
+        shared.auto_learn = True
+        w = object.__new__(fw.CameraWorker)
+        w.shared, w.platform, w.camera_key = shared, FakePlatform(), 'room'
+        rng = np.random.default_rng(0)
+        frame = rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+        aligned = rng.integers(0, 255, (112, 112, 3), dtype=np.uint8)        # high-frequency noise = sharp
+        face = np.array([500, 200, 120, 150] + [0] * 11, dtype=np.float32)
+        self.assertFalse(w.maybe_learn('A', 0.50, None, frame, face, aligned))  # not confident enough
+        self.assertFalse(w.maybe_learn('A', 0.92, None, frame, face, aligned))  # nothing new to learn
+        self.assertTrue(w.maybe_learn('A', 0.62, None, frame, face, aligned))
+        self.assertFalse(w.maybe_learn('A', 0.62, None, frame, face, aligned))  # once per day per child
+        small = face.copy()
+        small[2] = 50
+        self.assertFalse(w.maybe_learn('B', 0.62, None, frame, small, aligned))  # face too small
+        shared.verifier = object()
+        self.assertFalse(w.maybe_learn('C', 0.62, 0.30, frame, face, aligned))   # second model not convinced
+        self.assertTrue(w.maybe_learn('C', 0.62, 0.70, frame, face, aligned))
+        shared.auto_learn = False
+        self.assertFalse(w.maybe_learn('D', 0.62, 0.70, frame, face, aligned))   # school switched it off
+        self.assertEqual(FakePlatform.uploads, ['A', 'C'])
+
     def test_enrollment_quality(self):
         face = lambda w: [0, 0, w, w] + [0] * 11
         self.assertEqual(fw.enrollment_quality(np.zeros((0, 15)))[0], 'no_face')
