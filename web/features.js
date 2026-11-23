@@ -248,6 +248,8 @@ pages.students = async () => {
   const classId = state.cache.classId === 'all' ? 'all' : (classes.some(c => c.id === state.cache.classId) ? state.cache.classId : (classes[0] || {}).id);
   state.cache.classId = classId;
   const { students } = classId ? await api(sPath('/students' + (classId === 'all' ? '' : '?class_id=' + classId))) : { students: [] };
+  let tg = { parents: {}, bot_enabled: false };
+  try { tg = await api(sPath('/telegram/subscribers')); } catch { /* telegram is optional */ }
   const selected = new Set();
   const query = state.cache.studentQuery || '';
   const classItems = [h('div', { class: 'person-item' + (classId === 'all' ? ' selected' : '') },
@@ -291,6 +293,8 @@ pages.students = async () => {
         } }, '×') : null)),
       isAdmin() && s.photos.length < 5 ? uploadButton(s) : null)),
       h('td', {}, s.ai_ready ? tag('Готов', 'good') : s.photos.some(p => p.face_status === 'unchecked') ? tag('Ждёт проверки AI', 'dim') : tag('Нужны фото', 'bad')),
+      tg.bot_enabled ? h('td', {}, tg.parents[s.id] ? tag(`подписано: ${tg.parents[s.id]}`, 'good') : tag('нет', 'dim'), ' ',
+        h('button', { class: 'mini-btn neutral', type: 'button', title: 'Личная ссылка для родителей', onclick: () => parentLink(s) }, '🔗')) : null,
       isAdmin() ? h('td', { class: 'actions' },
         h('button', { class: 'mini-btn neutral', type: 'button', onclick: () => editStudentDialog(s, classes) }, 'Изменить'),
         h('button', { class: 'mini-btn', type: 'button', onclick: async () => {
@@ -325,8 +329,9 @@ pages.students = async () => {
   if (studentForm && realClassId) studentForm.querySelector('select').value = String(realClassId);
   const tools = isAdmin() ? h('div', { class: 'toolbar wrap' },
     h('button', { class: 'btn primary', type: 'button', onclick: importStudentsDialog }, '⬆ Импорт из Excel'),
-    h('button', { class: 'btn secondary', type: 'button', onclick: importPhotosDialog }, '🗂 Фото архивом')) : null;
-  const tbl = table([isAdmin() ? selectAll : null, 'Ученик', 'Фото (до 5)', 'AI', isAdmin() ? '' : null].filter(x => x !== null), tbody,
+    h('button', { class: 'btn secondary', type: 'button', onclick: importPhotosDialog }, '🗂 Фото архивом'),
+    tg.bot_enabled && classId !== 'all' && classId ? h('a', { class: 'btn secondary', href: sPath(`/classes/${classId}/parent-links.csv`) }, '✈ Ссылки родителям (Excel)') : null) : null;
+  const tbl = table([isAdmin() ? selectAll : null, 'Ученик', 'Фото (до 5)', 'AI', tg.bot_enabled ? 'Родители в Telegram' : null, isAdmin() ? '' : null].filter(x => x !== null), tbody,
     classes.length ? 'Нет учеников' : 'Создайте класс или импортируйте учеников из Excel');
   setTimeout(applyFilter);
   return h('div', {}, heading('DIRECTORY', 'Классы и ученики', 'Импортируйте список из Excel за минуту. Для распознавания нужно 1–5 чётких фото лица каждого ребёнка.', tools),
@@ -438,5 +443,78 @@ pages.overview = async () => {
     bar.style.width = bar.dataset.pct + '%';
     node.insertBefore(box, node.children[1] || null);
   } catch { /* checklist is a convenience only */ }
+  return node;
+};
+
+
+/* ------------------------------------------------------------------ Telegram */
+async function parentLink(s) {
+  try {
+    const r = await api(sPath(`/students/${s.id}/parent-link`), 'POST', {});
+    openDialog(`Telegram для родителей: ${s.full_name}`, h('div', {},
+      h('p', { class: 'hint' }, 'Личная ссылка этого ребёнка: родитель открывает её и нажимает «Старт». Подходит для 4 человек, действует 30 дней. Не отправляйте её в общий чат класса.'),
+      h('div', { class: 'secret' }, h('code', {}, r.url), h('div', { class: 'share-row' },
+        h('button', { type: 'button', class: 'mini-btn neutral', onclick: () => navigator.clipboard?.writeText(r.url).then(() => toast('Скопировано')) }, 'Копировать'))),
+      isAdmin() ? h('button', { type: 'button', class: 'link-btn', onclick: async () => {
+        if (!await confirmDialog('Отписать всех родителей этого ученика и отключить выданные ссылки?')) return;
+        const x = await api(sPath(`/students/${s.id}/parent-unsubscribe`), 'POST', {}); toast(`Отписано: ${x.unsubscribed}`); closeDialog(); refresh();
+      } }, 'Отписать всех родителей') : null));
+  } catch (e) { toast(e.message, true); }
+}
+
+NAV.splice(2, 0, ['telegram', '✈', 'Telegram', 'super']);
+pages.telegram = async () => {
+  const st = await api('/api/telegram');
+  const statusTag = st.enabled ? (st.status === 'running' ? tag('работает', 'good') : tag(st.status === 'error' ? 'ошибка' : 'запускается', st.status === 'error' ? 'bad' : 'warn'))
+    : tag('выключен', 'dim');
+  const out = h('div');
+  const check = h('button', { class: 'btn secondary', type: 'button', onclick: async () => {
+    try {
+      const r = await api('/api/telegram', 'POST', { action: 'check' });
+      out.replaceChildren(h('div', { class: 'alert' }, `Токен принадлежит боту @${r.username} («${r.name}»). Убедитесь, что это отдельный бот для посещаемости, а не бот другого проекта: включённый бот будет отвечать на все его сообщения.`),
+        h('button', { class: 'btn primary', type: 'button', onclick: async () => {
+          if (!await confirmDialog(`Включить @${r.username} как бот посещаемости для всех школ?`)) return;
+          try { await api('/api/telegram', 'POST', { action: 'enable' }); toast('Бот включён'); refresh(); } catch (e) { toast(e.message, true); }
+        } }, `Включить @${r.username}`));
+    } catch (e) { out.replaceChildren(h('div', { class: 'form-error' }, e.message)); }
+  } }, 'Проверить токен');
+  const disable = h('button', { class: 'btn secondary', type: 'button', onclick: async () => {
+    if (!await confirmDialog('Выключить бота? Уведомления перестанут приходить.')) return;
+    await api('/api/telegram', 'POST', { action: 'disable' }); toast('Бот выключен'); refresh();
+  } }, 'Выключить');
+  return h('div', {}, heading('NOTIFICATIONS', 'Telegram-бот платформы', 'Один бот для всех школ: родители получают уведомления только о своём ребёнке, сотрудники — о своей школе.'),
+    panel(h('div', { class: 'panel-title-row' }, h('h2', {}, st.username ? '@' + st.username : 'Бот не подключён'), statusTag),
+      st.last_error ? h('div', { class: 'alert bad' }, st.last_error) : null,
+      st.token_present ? null : h('div', { class: 'alert warn' }, 'На сервере нет токена: создайте бота у @BotFather и сохраните токен в data/telegram_token.txt.'),
+      h('div', { class: 'toolbar wrap' }, st.token_present ? check : null, st.enabled ? disable : null), out),
+    panel('Что получает каждый', h('ul', { class: 'steps' },
+      h('li', {}, 'Родитель: «пришёл в школу в 08:03», «опоздал», «не отмечен на 1-м уроке», «был в школе, но пропустил урок».'),
+      h('li', {}, 'Администратор и группа школы: «камера каб. 201 не работает во время урока — отметьте вручную».'),
+      h('li', {}, 'Команды: /status — посещаемость сегодня, /lang — русский / o‘zbekcha, /stop — отписаться.'))));
+};
+
+const _baseProfileDialog = profileDialog;
+profileDialog = function () {
+  _baseProfileDialog();
+  if (!state.me.school_id) return;
+  $('dialog-body').insertBefore(h('button', { type: 'button', class: 'btn secondary', onclick: async () => {
+    try { const r = await api('/api/telegram/staff-link', 'POST', {}); window.open(r.url, '_blank', 'noopener'); }
+    catch (e) { toast(e.message, true); }
+  } }, '✈ Получать уведомления школы в Telegram'), $('dialog-body').children[1] || null);
+};
+
+const _baseUsers = pages.users;
+pages.users = async () => {
+  const node = await _baseUsers();
+  if (!state.sid) return node;
+  const out = h('div');
+  node.append(panel('Telegram-группа школы', h('p', { class: 'hint' }, 'Подключите общую группу администрации или учителей: туда будут приходить предупреждения о неработающих камерах.'),
+    h('button', { class: 'btn secondary', type: 'button', onclick: async () => {
+      try {
+        const r = await api(sPath('/telegram/group-link'), 'POST', {});
+        out.replaceChildren(h('ol', { class: 'steps' }, h('li', {}, 'Добавьте бота ', h('code', {}, '@' + r.username), ' в группу (или откройте ', h('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, 'эту ссылку'), ').'),
+          h('li', {}, 'Отправьте в группе: ', h('code', {}, `/link ${r.code}`)), h('li', {}, 'Код одноразовый, действует 72 часа.')));
+      } catch (e) { out.replaceChildren(h('div', { class: 'form-error' }, e.message)); }
+    } }, 'Подключить группу'), out));
   return node;
 };

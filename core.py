@@ -64,6 +64,8 @@ LOGIN_FAILED = 'Неверный логин или пароль (после 5 о
 INVITE_TTL = timedelta(hours=72)
 PHONE_RE = re.compile(r'^\+?[0-9 ()\-]{7,20}$')
 EMAIL_RE = re.compile(r'^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,20}$')
+TG_PARENT_TTL = timedelta(days=30)
+TG_NOTIFY_WINDOW = timedelta(hours=3)
 PASSWORD_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
 
 
@@ -326,6 +328,25 @@ CREATE TABLE IF NOT EXISTS applications (
     status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','approved','rejected')), school_id INTEGER,
     ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, decided_at TEXT
 );
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tg_codes (
+    code_hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('parent','staff','group')),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    uses_left INTEGER NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_links (
+    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, chat_type TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('parent','staff','group')),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    lang TEXT NOT NULL DEFAULT 'ru', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+    UNIQUE (chat_id, kind, school_id, student_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS tg_sent (key TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_tg_links_school ON tg_links(school_id, kind, active);
 CREATE INDEX IF NOT EXISTS idx_events_school_day ON events(school_id, local_day, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_student_day ON events(student_id, local_day);
 CREATE INDEX IF NOT EXISTS idx_events_review ON events(school_id, review_status);
@@ -1629,3 +1650,205 @@ class Store:
             d += timedelta(days=1)
         header = ['Дата', 'Класс', 'Урок №', 'Время', 'Предмет', 'Код ученика', 'Ученик', 'Отметка', 'Статус', 'Источник', 'Замечен в']
         return header, rows
+
+    # ------------------------------------------------------------------ settings
+    def get_setting(self, key):
+        with self.connect() as db:
+            row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return row['value'] if row and row['value'] != '' else None
+
+    def set_setting(self, key, value, actor=None):
+        with self.connect() as db:
+            db.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                       (key, '' if value is None else str(value)))
+            if actor is not None:
+                self._audit(db, actor, None, 'setting.' + key, str(value)[:60])
+
+    # ------------------------------------------------------------------ telegram: link codes
+    def _tg_code(self, db, kind, sid, student_id=None, user_id=None, uses=1, ttl=INVITE_TTL):
+        code = {'parent': 'p', 'staff': 's', 'group': 'g'}[kind] + secrets.token_urlsafe(18)
+        now = now_utc()
+        db.execute('INSERT INTO tg_codes(code_hash,kind,school_id,student_id,user_id,uses_left,created_at,expires_at) '
+                   'VALUES(?,?,?,?,?,?,?,?)', (sha256_hex(code), kind, sid, student_id, user_id, uses, iso(now), iso(now + ttl)))
+        return code
+
+    def tg_parent_codes(self, sid, student_ids, actor=None):
+        """Personal deep-link codes (valid 30 days, up to 4 parents/guardians each)."""
+        out = []
+        with self.connect() as db:
+            for stid in student_ids:
+                st = self._student(db, sid, stid)
+                out.append({'student_id': stid, 'code': st['code'], 'full_name': st['full_name'],
+                            'tg_code': self._tg_code(db, 'parent', sid, student_id=stid, uses=4, ttl=TG_PARENT_TTL)})
+            self._audit(db, actor, sid, 'telegram.parent_links', f'{len(out)} student(s)')
+        return out
+
+    def tg_staff_code(self, user):
+        if not user.get('school_id'):
+            raise InputError('Уведомления в Telegram доступны сотрудникам школы')
+        with self.connect() as db:
+            return self._tg_code(db, 'staff', user['school_id'], user_id=user['id'])
+
+    def tg_group_code(self, sid, actor=None):
+        with self.connect() as db:
+            self._school(db, sid)
+            code = self._tg_code(db, 'group', sid)
+            self._audit(db, actor, sid, 'telegram.group_link', '')
+            return code
+
+    def tg_redeem(self, code, chat_id, chat_type, lang='ru'):
+        if not isinstance(code, str) or not re.fullmatch(r'[psg][A-Za-z0-9_-]{20,40}', code):
+            raise NotFound('bad code')
+        lang = lang if lang in ('ru', 'uz') else 'ru'
+        with self.connect() as db:
+            row = db.execute('SELECT c.*, s.name AS school_name FROM tg_codes c JOIN schools s ON s.id=c.school_id '
+                             'WHERE c.code_hash=?', (sha256_hex(code),)).fetchone()
+            if row is None or row['uses_left'] < 1 or from_iso(row['expires_at']) <= now_utc():
+                raise NotFound('expired')
+            is_group = chat_type in ('group', 'supergroup')
+            if (row['kind'] == 'group') != is_group:
+                raise InputError('wrong chat type')  # parent/staff links only in private chats (child data stays private)
+            db.execute('UPDATE tg_codes SET uses_left=uses_left-1 WHERE code_hash=?', (sha256_hex(code),))
+            db.execute('INSERT INTO tg_links(chat_id,chat_type,kind,school_id,student_id,user_id,lang,created_at) VALUES(?,?,?,?,?,?,?,?) '
+                       'ON CONFLICT(chat_id,kind,school_id,student_id,user_id) DO UPDATE SET active=1, lang=excluded.lang',
+                       (chat_id, chat_type, row['kind'], row['school_id'], row['student_id'], row['user_id'], lang, iso(now_utc())))
+            info = {'kind': row['kind'], 'school': row['school_name'], 'name': '', 'cls': ''}
+            if row['student_id']:
+                st = db.execute('SELECT s.full_name, c.name FROM students s JOIN classes c ON c.id=s.class_id WHERE s.id=?',
+                                (row['student_id'],)).fetchone()
+                info.update(name=st['full_name'], cls=st['name'])
+            elif row['user_id']:
+                info['name'] = db.execute('SELECT full_name FROM users WHERE id=?', (row['user_id'],)).fetchone()['full_name']
+            self._audit(db, {'username': f'telegram:{chat_id}'}, row['school_id'], f"telegram.link_{row['kind']}", info['name'])
+        return info
+
+    def tg_unlink_chat(self, chat_id):
+        with self.connect() as db:
+            return db.execute('UPDATE tg_links SET active=0 WHERE chat_id=? AND active=1', (chat_id,)).rowcount
+
+    tg_deactivate_chat = tg_unlink_chat
+
+    def tg_chat_lang(self, chat_id):
+        with self.connect() as db:
+            row = db.execute('SELECT lang FROM tg_links WHERE chat_id=? ORDER BY active DESC, id DESC LIMIT 1', (chat_id,)).fetchone()
+        return row['lang'] if row else None
+
+    def tg_set_lang(self, chat_id, lang):
+        with self.connect() as db:
+            db.execute('UPDATE tg_links SET lang=? WHERE chat_id=?', ('uz' if lang == 'uz' else 'ru', chat_id))
+
+    def tg_subscribers(self, sid):
+        with self.connect() as db:
+            parents = {r['student_id']: r['n'] for r in db.execute(
+                "SELECT student_id, COUNT(*) AS n FROM tg_links WHERE school_id=? AND kind='parent' AND active=1 GROUP BY student_id", (sid,))}
+            staff = db.execute("SELECT COUNT(*) FROM tg_links WHERE school_id=? AND kind IN ('staff','group') AND active=1", (sid,)).fetchone()[0]
+        return {'parents': parents, 'staff_chats': staff}
+
+    def tg_unsubscribe_student(self, sid, stid, actor=None):
+        with self.connect() as db:
+            self._student(db, sid, stid)
+            n = db.execute("UPDATE tg_links SET active=0 WHERE school_id=? AND student_id=? AND kind='parent'", (sid, stid)).rowcount
+            db.execute("DELETE FROM tg_codes WHERE school_id=? AND student_id=?", (sid, stid))
+            self._audit(db, actor, sid, 'telegram.unsubscribe_student', str(stid))
+        return {'unsubscribed': n}
+
+    def _day_status(self, grid, student_id):
+        cells = next((r['cells'] for r in grid['rows'] if r['student']['id'] == student_id), {})
+        order = [str(l['id']) for l in grid['lessons']]
+        seen = [cells[k]['status'] for k in order if cells[k]['status'] in ('present', 'late')]
+        if seen:
+            return seen[0]
+        done = [cells[k]['status'] for k in order if cells[k]['status'] not in ('upcoming',)]
+        return done[-1] if done else 'upcoming'
+
+    def tg_status_lines(self, chat_id):
+        with self.connect() as db:
+            links = [dict(r) for r in db.execute('SELECT * FROM tg_links WHERE chat_id=? AND active=1', (chat_id,))]
+        lines, today = [], local_today()
+        for link in links:
+            if link['kind'] == 'parent':
+                with self.connect() as db:
+                    st = db.execute('SELECT id, full_name, class_id FROM students WHERE id=?', (link['student_id'],)).fetchone()
+                grid = self.attendance(link['school_id'], st['class_id'], today)
+                lines.append((st['full_name'], self._day_status(grid, st['id'])))
+            else:
+                o = self.overview(link['school_id'], today)
+                lines.append((o['school']['name'], f"{o['stats']['seen_today']}/{o['stats']['students']}"))
+        return lines
+
+    # ------------------------------------------------------------------ telegram: what to send
+    def tg_pending_notifications(self, now=None):
+        """[(chat_id, lang, template_key, fields)] for today; caller de-duplicates via tg_mark_sent."""
+        now = now or now_utc()
+        day = now.astimezone(TZ).date().isoformat()
+        horizon = now - TG_NOTIFY_WINDOW
+        out = []
+        with self.connect() as db:
+            links = [dict(r) for r in db.execute('SELECT l.*, s.class_id, s.full_name FROM tg_links l LEFT JOIN students s ON s.id=l.student_id '
+                                                 'WHERE l.active=1')]
+            sent = {r['key'] for r in db.execute('SELECT key FROM tg_sent WHERE key LIKE ?', (f'%{day}%',))}
+        by_class = {}
+        for link in links:
+            if link['kind'] == 'parent':
+                by_class.setdefault((link['school_id'], link['class_id']), []).append(link)
+        for (sid, cid), plinks in by_class.items():
+            grid = self.attendance(sid, cid, day, now=now)
+            lessons = grid['lessons']
+            for link in plinks:
+                row = next((r for r in grid['rows'] if r['student']['id'] == link['student_id']), None)
+                if row is None:
+                    continue
+                name, chat, lang = link['full_name'], link['chat_id'], link['lang']
+                present_before = False
+                for n, lesson in enumerate(lessons, start=1):
+                    c = row['cells'][str(lesson['id'])]
+                    title = f"{n}. {lesson['subject']}"
+                    slot = f"{lesson['start_time']}–{lesson['end_time']}"
+                    end = datetime.combine(datetime.fromisoformat(day).date(), datetime.strptime(lesson['end_time'], '%H:%M').time(), TZ)
+                    if c['status'] in ('present', 'late'):
+                        if not present_before and c.get('first_seen') and from_iso(c['first_seen']) >= horizon:
+                            key = f"arr:{link['student_id']}:{day}"
+                            fields = {'name': name, 'lesson': title, 'time': from_iso(c['first_seen']).astimezone(TZ).strftime('%H:%M')}
+                            out.append((chat, lang, 'arrived' if c['status'] == 'present' else 'late', {**fields, '_dedupe': key}))
+                        present_before = True
+                    elif c['status'] == 'absent' and end >= horizon:
+                        if present_before:
+                            key = f"abs:{link['student_id']}:{lesson['id']}:{day}"
+                            out.append((chat, lang, 'absent_after', {'name': name, 'lesson': title, 'slot': slot, '_dedupe': key}))
+                        else:
+                            key = f"absday:{link['student_id']}:{day}"
+                            out.append((chat, lang, 'absent_first', {'name': name, 'lesson': title, 'slot': slot, '_dedupe': key}))
+        # cameras that went blind during a running lesson -> school staff and groups
+        staff = {}
+        for link in links:
+            if link['kind'] in ('staff', 'group'):
+                staff.setdefault(link['school_id'], []).append(link)
+        cutoff = now - timedelta(seconds=CAMERA_ONLINE_SECONDS + 120)
+        for sid, slinks in staff.items():
+            o = self.overview(sid, day, now=now)
+            cams = {c['id']: c for c in o['cameras']}
+            for l in o['lessons']:
+                cam = cams.get(l['camera_id'])
+                start = datetime.combine(datetime.fromisoformat(day).date(), datetime.strptime(l['start_time'], '%H:%M').time(), TZ)
+                if l['state'] != 'in_progress' or cam is None or now - start < timedelta(minutes=5):
+                    continue
+                if cam['last_seen_at'] and from_iso(cam['last_seen_at']) >= cutoff and cam['last_ok']:
+                    continue
+                key = f"cam:{l['id']}:{day}"
+                for link in slinks:
+                    out.append((link['chat_id'], link['lang'], 'camera_down', {'camera': cam['name'], 'cls': l['class_name'],
+                                                                               'lesson': l['subject'], 'slot': f"{l['start_time']}–{l['end_time']}",
+                                                                               '_dedupe': key}))
+        return [item for item in out if f"{item[3]['_dedupe']}:{item[0]}" not in sent]
+
+    def tg_mark_sent(self, key):
+        with self.connect() as db:
+            try:
+                db.execute('INSERT INTO tg_sent(key,created_at) VALUES(?,?)', (key, iso(now_utc())))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def tg_unmark_sent(self, key):
+        with self.connect() as db:
+            db.execute('DELETE FROM tg_sent WHERE key=?', (key,))

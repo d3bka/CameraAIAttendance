@@ -24,6 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import imports
+import telegram_bot
 from core import Forbidden, InputError, NotFound, Store, local_today, TZ_NAME
 
 ROOT = Path(__file__).resolve().parent
@@ -671,6 +672,106 @@ def export_attendance(h, sid):
     h.wfile.write(data)
 
 
+# ============================================================== telegram (one platform bot)
+def _bot_username(h):
+    username = h.server.store.get_setting('telegram_bot_username')
+    if not (username and h.server.store.get_setting('telegram_enabled')):
+        raise InputError('Telegram-бот ещё не подключён (супер-админ → раздел «Telegram»)')
+    return username
+
+
+def _token_loader(h):
+    return getattr(h.server, 'telegram_token_loader', lambda: None)()
+
+
+@route('GET', r'/api/telegram', 'super')
+def telegram_status(h):
+    bot = getattr(h.server, 'bot', None)
+    return {'enabled': bool(h.server.store.get_setting('telegram_enabled')),
+            'username': h.server.store.get_setting('telegram_bot_username'),
+            'status': bot.status if bot else 'disabled', 'last_error': bot.last_error if bot else '',
+            'token_present': bool(_token_loader(h))}
+
+
+@route('POST', r'/api/telegram', 'super')
+def telegram_control(h):
+    action = h.body.get('action')
+    store = h.server.store
+    if action == 'disable':
+        store.set_setting('telegram_enabled', '', h.actor())
+        return {'enabled': False}
+    if action not in ('check', 'enable'):
+        raise InputError('action: check, enable или disable')
+    token = _token_loader(h)
+    if not token:
+        raise InputError('Нет токена: сохраните его в data/telegram_token.txt на сервере')
+    try:
+        me = telegram_bot.TelegramAPI(token).call('getMe')
+    except ConnectionError:
+        raise InputError('Нет связи с api.telegram.org') from None
+    if not me.get('ok'):
+        raise InputError('Telegram отклонил токен: ' + str(me.get('description', ''))[:120])
+    username = me['result']['username']
+    if action == 'enable':
+        store.set_setting('telegram_bot_username', username, h.actor())
+        store.set_setting('telegram_enabled', '1', h.actor())
+        bot = getattr(h.server, 'bot', None)
+        if bot:
+            bot.api = None  # re-initialise with the confirmed bot
+    return {'username': username, 'name': me['result'].get('first_name'), 'enabled': action == 'enable'}
+
+
+@route('POST', r'/api/telegram/staff-link', 'session')
+def telegram_staff_link(h):
+    username = _bot_username(h)
+    code = h.server.store.tg_staff_code(h.user)
+    return {'url': f'https://t.me/{username}?start={code}'}
+
+
+@route('POST', r'/api/s/(\d{1,9})/telegram/group-link', 'admin')
+def telegram_group_link(h, sid):
+    username = _bot_username(h)
+    code = h.server.store.tg_group_code(sid, h.actor())
+    return {'code': code, 'username': username, 'url': f'https://t.me/{username}?startgroup={code}'}
+
+
+@route('POST', r'/api/s/(\d{1,9})/students/(\d{1,9})/parent-link', 'staff')
+def telegram_parent_link(h, sid, stid):
+    username = _bot_username(h)
+    item = h.server.store.tg_parent_codes(sid, [stid], h.actor())[0]
+    return {'url': f"https://t.me/{username}?start={item['tg_code']}", 'full_name': item['full_name']}
+
+
+@route('POST', r'/api/s/(\d{1,9})/students/(\d{1,9})/parent-unsubscribe', 'admin')
+def telegram_parent_unsubscribe(h, sid, stid):
+    return h.server.store.tg_unsubscribe_student(sid, stid, h.actor())
+
+
+@route('GET', r'/api/s/(\d{1,9})/classes/(\d{1,9})/parent-links.csv', 'staff')
+def telegram_class_links(h, sid, cid):
+    username = _bot_username(h)
+    ids = [s['id'] for s in h.server.store.list_students(sid, cid)]
+    items = h.server.store.tg_parent_codes(sid, ids, h.actor())
+    data = imports.csv_bytes(['Код', 'Ученик', 'Ссылка для родителей (личная, не пересылать в общий чат)'],
+                             [[i['code'], i['full_name'], f"https://t.me/{username}?start={i['tg_code']}"] for i in items])
+    h.send_response(200)
+    h.send_header('Content-Type', 'text/csv; charset=utf-8')
+    h.send_header('Content-Disposition', f'attachment; filename="telegram_links_class_{cid}.csv"')
+    h.send_header('Content-Length', str(len(data)))
+    h.send_header('Cache-Control', 'no-store')
+    h.common_headers()
+    h.end_headers()
+    h.wfile.write(data)
+
+
+@route('GET', r'/api/s/(\d{1,9})/telegram/subscribers', 'staff')
+def telegram_subscribers(h, sid):
+    data = h.server.store.tg_subscribers(sid)
+    data['parents'] = {str(k): v for k, v in data['parents'].items()}
+    data['bot_enabled'] = bool(h.server.store.get_setting('telegram_enabled'))
+    return data
+
+
 # ============================================================== devices / AI worker (school token)
 @route('GET', r'/api/health', 'public')
 def health(h):
@@ -736,6 +837,19 @@ def main(argv=None):
     except OSError as exc:
         print(f'Не удалось открыть порт {args.port}: {exc}. Укажите другой: --port 8080', file=sys.stderr)
         sys.exit(1)
+    token_file = db.parent / 'telegram_token.txt'
+
+    def load_token():
+        if os.environ.get('ATTENDANCE_TELEGRAM_TOKEN'):
+            return os.environ['ATTENDANCE_TELEGRAM_TOKEN'].strip()
+        try:
+            return token_file.read_text(encoding='utf-8-sig').strip() or None
+        except OSError:
+            return None
+
+    server.telegram_token_loader = load_token
+    server.bot = telegram_bot.Bot(store, load_token)
+    server.bot.start()  # stays idle until a superadmin enables it in the panel
     print(f'Camera Attendance AI → http://{args.host}:{args.port}', flush=True)
     try:
         server.serve_forever()
