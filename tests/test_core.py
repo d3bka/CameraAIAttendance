@@ -199,6 +199,24 @@ class IngestTests(Base):
             self.store.ingest(self.a, {'camera_key': 'a_gate', 'event_uid': 'naive', 'event_type': 'motion',
                                        'observed_at': '2026-01-01T00:00:00'})
 
+    def test_second_model_opinion(self):
+        now = datetime.now(timezone.utc)
+        base = {'camera_key': 'a_room', 'event_type': 'face_match', 'verification_method': 'ai_face',
+                'person_code': 'S1', 'observed_at': now.isoformat()}
+        # borderline main score, second model agrees -> accepted automatically
+        r = self.store.ingest(self.a, {**base, 'event_uid': 's1', 'confidence': 0.40, 'second_score': 0.55})
+        self.assertEqual((r['verified'], r['review_status']), (True, 'auto'))
+        # second model disagrees -> dropped even with a high main score
+        r = self.store.ingest(self.a, {**base, 'event_uid': 's2', 'confidence': 0.70, 'second_score': 0.10})
+        self.assertEqual(r, {'stored': False, 'reason': 'second_model_reject'})
+        # second model unsure -> old rules
+        r = self.store.ingest(self.a, {**base, 'event_uid': 's3', 'confidence': 0.40, 'second_score': 0.30})
+        self.assertEqual(r['review_status'], 'pending')
+        with self.assertRaises(InputError):
+            self.store.ingest(self.a, {**base, 'event_uid': 's4', 'confidence': 0.40, 'second_score': 1.5})
+        ev = {e['id']: e for e in self.store.list_events(self.a, core.local_today())}
+        self.assertEqual(sorted(e['second_score'] for e in ev.values()), [0.30, 0.55])
+
     def test_review_flow(self):
         eid = self.face('S2', datetime.now(timezone.utc), 0.40)['id']
         self.assertEqual(len(self.store.list_reviews(self.a)), 1)

@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -50,6 +51,15 @@ MODELS = {
                    'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx',
                    '0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79'),
 }
+
+
+# Optional second-opinion model (ArcFace R50, InsightFace "buffalo_l" pack).
+# LICENSE: InsightFace pretrained models are for NON-COMMERCIAL research use; obtain a commercial
+# licence or swap in another 512-d ONNX face model (same 112x112 aligned input) before selling the product.
+VERIFIER = ('w600k_r50.onnx', 'https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip',
+            '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43')
+VERIFIER_ACCEPT = 0.40   # ArcFace cosine: same person with high probability
+VERIFIER_REJECT = 0.20   # ArcFace cosine: almost certainly a different person -> veto
 
 
 def redact(url: str) -> str:
@@ -121,6 +131,59 @@ class FaceEngine:
         return (feature / norm if norm else feature), aligned
 
 
+class Verifier:
+    """Second, stronger face model. Runs only on faces the main model already matched to a child,
+    so CPU cost stays low. ONNX Runtime sessions are safe to share between camera threads."""
+
+    def __init__(self, path: Path):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 2
+        self.session = ort.InferenceSession(str(path), opts, providers=['CPUExecutionProvider'])
+        self.input = self.session.get_inputs()[0].name
+
+    def embed(self, aligned_bgr):
+        rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        blob = ((rgb - 127.5) / 127.5).transpose(2, 0, 1)[None]
+        feature = self.session.run(None, {self.input: blob})[0][0].astype(np.float32)
+        norm = float(np.linalg.norm(feature))
+        return feature / norm if norm else feature
+
+
+def load_verifier(models_dir: Path, path=None, download=False, disabled=False):
+    """Return a Verifier or None (the worker runs fine without it)."""
+    if disabled:
+        return None
+    name, url, digest = VERIFIER
+    target = Path(path) if path else models_dir / name
+    if not target.exists():
+        if not download:
+            LOG.info('Second-opinion model not installed (optional): python face_worker.py --download-verifier')
+            return None
+        LOG.info('Downloading second-opinion model pack (~290 MB, non-commercial licence) ...')
+        models_dir.mkdir(parents=True, exist_ok=True)
+        tmp = models_dir / 'buffalo_l.zip.part'
+        with requests.get(url, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            with tmp.open('wb') as fh:
+                for chunk in resp.iter_content(1 << 20):
+                    fh.write(chunk)
+        with zipfile.ZipFile(tmp) as zf:
+            member = next(m for m in zf.namelist() if m.endswith(name))
+            target.write_bytes(zf.read(member))
+        tmp.unlink(missing_ok=True)
+    if not path and file_sha256(target) != digest:
+        target.unlink(missing_ok=True)
+        raise SystemExit(f'Checksum mismatch for {name}; file removed. Re-run --download-verifier.')
+    try:
+        verifier = Verifier(target)
+    except ImportError:
+        LOG.warning('onnxruntime is not installed; second-opinion model disabled (pip install onnxruntime)')
+        return None
+    LOG.info('Second-opinion model enabled: %s (accept >= %.2f, veto < %.2f)', target.name, VERIFIER_ACCEPT, VERIFIER_REJECT)
+    return verifier
+
+
 def blur_score(crop) -> float:
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -147,17 +210,30 @@ class Gallery:
     def __init__(self):
         self.features = np.zeros((0, 128), dtype=np.float32)
         self.codes: list[str] = []
-        self.by_sha: dict[str, tuple[str, np.ndarray | None]] = {}
+        self.second: dict[str, np.ndarray] = {}   # student code -> stacked second-model templates
+        self.by_sha: dict[str, tuple] = {}
 
     def rebuild(self, entries):
-        """entries: iterable of (student_code, feature or None)."""
-        feats, codes = [], []
-        for code, feat in entries:
+        """entries: iterable of (student_code, feature or None[, second_feature or None])."""
+        feats, codes, second = [], [], {}
+        for entry in entries:
+            code, feat = entry[0], entry[1]
+            feat2 = entry[2] if len(entry) > 2 else None
             if feat is not None:
                 feats.append(feat)
                 codes.append(code)
+                if feat2 is not None:
+                    second.setdefault(code, []).append(feat2)
         self.features = np.vstack(feats).astype(np.float32) if feats else np.zeros((0, 128), dtype=np.float32)
         self.codes = codes
+        self.second = {code: np.vstack(v).astype(np.float32) for code, v in second.items()}
+
+    def verify(self, code, feature2):
+        """Second-model score of this face against the child's own templates (None if unavailable)."""
+        templates = self.second.get(code)
+        if templates is None or feature2 is None:
+            return None
+        return float((templates @ feature2).max())
 
     @property
     def students(self):
@@ -188,9 +264,10 @@ class Confirmer:
         self.hits: dict[str, collections.deque] = {}
         self.last_sent: dict[str, float] = {}
 
-    def observe(self, code: str, score: float, now: float):
+    def observe(self, code: str, score: float, now: float, second: float | None = None):
+        """Returns None, or (median main score, median second-model score or None) when confirmed."""
         q = self.hits.setdefault(code, collections.deque())
-        q.append((now, score))
+        q.append((now, score, second))
         while q and now - q[0][0] > self.window:
             q.popleft()
         if len(q) < self.min_hits:
@@ -198,9 +275,10 @@ class Confirmer:
         if now - self.last_sent.get(code, -1e9) < self.cooldown:
             return None
         self.last_sent[code] = now
-        confidence = statistics.median(s for _, s in q)
+        confidence = statistics.median(s for _, s, _ in q)
+        seconds = [s2 for _, _, s2 in q if s2 is not None]
         q.clear()
-        return confidence
+        return confidence, (statistics.median(seconds) if seconds else None)
 
 
 # --------------------------------------------------------------------------- I/O
@@ -291,11 +369,13 @@ class Platform:
         except requests.RequestException as exc:
             LOG.warning('[%s] heartbeat failed: %s', self.camera_key, type(exc).__name__)
 
-    def send_match(self, code, confidence):
-        self.outbox.append({'camera_key': self.camera_key, 'event_uid': 'face-' + uuid.uuid4().hex,
-                            'event_type': 'face_match', 'verification_method': 'ai_face', 'person_code': code,
-                            'confidence': round(float(confidence), 4),
-                            'observed_at': datetime.now(timezone.utc).isoformat()})
+    def send_match(self, code, confidence, second=None):
+        event = {'camera_key': self.camera_key, 'event_uid': 'face-' + uuid.uuid4().hex,
+                 'event_type': 'face_match', 'verification_method': 'ai_face', 'person_code': code,
+                 'confidence': round(float(confidence), 4), 'observed_at': datetime.now(timezone.utc).isoformat()}
+        if second is not None:
+            event['second_score'] = round(min(1.0, max(0.0, float(second))), 4)
+        self.outbox.append(event)
         self.flush()
 
     def flush(self):
@@ -312,8 +392,9 @@ class Platform:
                 LOG.warning('[%s] event rejected: HTTP %s %s', self.camera_key, r.status_code, r.text[:200])
             else:
                 body = r.json()
-                LOG.info('[%s] recognised %s (%.2f) -> %s', self.camera_key, event['person_code'], event['confidence'],
-                         'confirmed' if body.get('verified') else body.get('review_status') or body.get('reason'))
+                second = f", 2nd model {event['second_score']:.2f}" if 'second_score' in event else ''
+                LOG.info('[%s] recognised %s (%.2f%s) -> %s', self.camera_key, event['person_code'], event['confidence'],
+                         second, 'confirmed' if body.get('verified') else body.get('review_status') or body.get('reason'))
 
 
 class SharedGallery:
@@ -323,10 +404,15 @@ class SharedGallery:
         self.lock = threading.Lock()
         self.gallery = Gallery()
         self.review_threshold = 0.363
+        self.verifier: Verifier | None = None
 
     def match(self, feature, margin):
         with self.lock:
             return self.gallery.match(feature, margin), self.review_threshold
+
+    def verify(self, code, feature2):
+        with self.lock:
+            return self.gallery.verify(code, feature2)
 
 
 def sync_gallery(engine: FaceEngine, platform: Platform, shared: SharedGallery, min_face_px=60):
@@ -337,7 +423,7 @@ def sync_gallery(engine: FaceEngine, platform: Platform, shared: SharedGallery, 
         for photo in student['photos']:
             cached = cache.get(photo['sha256'])
             if cached is None:
-                feature, status = None, 'unreadable'
+                feature, feature2, status = None, None, 'unreadable'
                 try:
                     data = np.frombuffer(platform.photo(photo['id']), dtype=np.uint8)
                     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -345,17 +431,19 @@ def sync_gallery(engine: FaceEngine, platform: Platform, shared: SharedGallery, 
                         faces = engine.detect(image, max_width=1280)
                         status, idx = enrollment_quality(faces, min_face_px)
                         if idx is not None:
-                            feature, _ = engine.embed(image, faces[idx])
+                            feature, aligned = engine.embed(image, faces[idx])
+                            if shared.verifier is not None:
+                                feature2 = shared.verifier.embed(aligned)
                 except requests.RequestException as exc:
                     LOG.warning('Photo download failed: %s', type(exc).__name__)
                     continue
-                cached = (status, feature)
+                cached = (status, feature, feature2)
                 if status != photo.get('face_status'):
                     platform.photo_quality(photo['id'], status)
             entries.append((student['code'], photo['sha256'], cached))
     fresh = Gallery()
     fresh.by_sha = {sha: cached for _, sha, cached in entries}
-    fresh.rebuild((code, cached[1]) for code, _, cached in entries)
+    fresh.rebuild((code, cached[1], cached[2] if len(cached) > 2 else None) for code, _, cached in entries)
     with shared.lock:
         shared.gallery = fresh
         shared.review_threshold = roster['face_review_threshold']
@@ -485,10 +573,16 @@ class CameraWorker(threading.Thread):
             if score < review_threshold:
                 self.stats['unknown'] += 1
                 continue
-            confidence = self.confirmer.observe(code, score, time.monotonic())
-            if confidence is not None:
+            second = None
+            if self.shared.verifier is not None:
+                second = self.shared.verify(code, self.shared.verifier.embed(crop))
+                if second is not None and second < VERIFIER_REJECT:
+                    self.stats['vetoed'] += 1  # the stronger model says: not this child
+                    continue
+            confirmed = self.confirmer.observe(code, score, time.monotonic(), second)
+            if confirmed is not None:
                 self.stats['matches'] += 1
-                self.platform.send_match(code, confidence)
+                self.platform.send_match(code, *confirmed)
         if args.show:
             preview = frame.copy()
             for face in faces:
@@ -539,6 +633,7 @@ def run(args):
     engine = FaceEngine(paths, det_score=args.det_score)
     control = Platform(args.api, token, 'control')
     shared = SharedGallery()
+    shared.verifier = load_verifier(Path(args.models_dir), args.verifier, args.download_verifier, args.no_verifier)
     sync_gallery(engine, control, shared, args.enroll_min_face)
     if args.check_photos:
         LOG.info('Photo check finished; see statuses in the admin panel')
@@ -609,10 +704,16 @@ def main(argv=None):
     parser.add_argument('--sync-every', type=float, default=300.0, help='Seconds between photo/gallery refreshes')
     parser.add_argument('--schedule-every', type=float, default=120.0, help='Seconds between schedule refreshes')
     parser.add_argument('--show', action='store_true', help='Debug preview window (local use only)')
+    parser.add_argument('--verifier', help='Path to a second-opinion 512-d ONNX face model (default: models/w600k_r50.onnx)')
+    parser.add_argument('--download-verifier', action='store_true', help='Download ArcFace R50 (InsightFace, non-commercial licence)')
+    parser.add_argument('--no-verifier', action='store_true', help='Disable the second-opinion model')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    if args.download_models and not (args.camera_key or args.config):
-        ensure_models(Path(args.models_dir), download=True)
+    if (args.download_models or args.download_verifier) and not (args.camera_key or args.config):
+        if args.download_models:
+            ensure_models(Path(args.models_dir), download=True)
+        if args.download_verifier:
+            load_verifier(Path(args.models_dir), args.verifier, download=True)
         LOG.info('Models ready in %s', args.models_dir)
         return
     if not (args.camera_key or args.config or args.check_photos):

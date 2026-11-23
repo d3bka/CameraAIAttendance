@@ -498,7 +498,7 @@ pages.reviews = async () => {
   const cards = reviews.map(r => h('div', { class: 'review' },
     r.photo_id ? h('img', { src: photoUrl(r.photo_id), alt: 'эталонное фото' }) : h('div', { class: 'initial big' }, r.full_name.slice(0, 2)),
     h('div', { class: 'event-body' }, h('strong', {}, `${r.full_name} · ${r.class_name}`),
-      h('small', {}, `${r.camera_name} (${r.room}) · ${fmtDateTime(r.occurred_at)} · уверенность ${pct(r.confidence)}`)),
+      h('small', {}, `${r.camera_name} (${r.room}) · ${fmtDateTime(r.occurred_at)} · уверенность ${pct(r.confidence)}${r.second_score !== null && r.second_score !== undefined ? ' · 2-я модель ' + pct(r.second_score) : ''}`)),
     h('div', { class: 'actions' },
       h('button', { class: 'btn primary small', type: 'button', onclick: () => decide(r.id, 'confirm') }, 'Да, это он/она'),
       h('button', { class: 'btn secondary small', type: 'button', onclick: () => decide(r.id, 'reject') }, 'Нет'))));
@@ -558,7 +558,8 @@ pages.events = async () => {
   const { events } = await api(sPath('/events?date=' + date));
   const rows = events.map(e => h('tr', {}, h('td', {}, fmtTime(e.occurred_at)), h('td', {}, e.camera_name),
     h('td', {}, EVENT_NAMES[e.event_type] || e.event_type), h('td', {}, e.full_name ? `${e.full_name} (${e.class_name})` : '—'),
-    h('td', {}, e.confidence ? pct(e.confidence) : '—'),
+    h('td', {}, e.confidence ? pct(e.confidence) : '—', e.second_score !== null && e.second_score !== undefined
+      ? h('div', { class: 'device-meta' }, '2-я модель: ' + pct(e.second_score)) : null),
     h('td', {}, e.verified ? tag('Подтверждено', 'good') : e.review_status === 'pending' ? tag('На проверке', 'warn') : e.review_status === 'rejected' ? tag('Отклонено', 'bad') : tag('Без идентификации', 'dim'))));
   return h('div', {}, heading('AUDIT LOG', 'События', 'Распознавания AI, проходы СКУД и движение. До 300 записей за день.', datePicker(date, d => { state.cache.date = d; refresh(); })),
     panel(null, table(['Время', 'Камера', 'Тип', 'Ученик', 'Уверенность', 'Статус'], rows, 'Событий нет')));

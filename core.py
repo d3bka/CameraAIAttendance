@@ -51,6 +51,8 @@ CAMERA_ONLINE_SECONDS = 180
 PRE_LESSON_MINUTES = 10
 MIN_CAMERA_COVERAGE = 0.6
 AGGREGATE_PENDING_HITS = 2
+SECOND_MODEL_ACCEPT = 0.40  # second-opinion model (ArcFace) agrees -> accept
+SECOND_MODEL_REJECT = 0.20  # second-opinion model disagrees -> drop the match
 ENTRY_WINDOW_BEFORE = timedelta(minutes=90)
 ENTRY_WINDOW_AFTER = timedelta(minutes=30)
 PBKDF2_ITERATIONS = int(os.environ.get('ATTENDANCE_PBKDF2_ITERATIONS', '600000'))
@@ -285,6 +287,7 @@ CREATE TABLE IF NOT EXISTS events (
     camera_id INTEGER NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
     student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
     event_type TEXT NOT NULL, verification_method TEXT NOT NULL, confidence REAL,
+    second_score REAL,
     review_status TEXT NOT NULL DEFAULT 'none', verified INTEGER NOT NULL DEFAULT 0,
     reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     occurred_at TEXT NOT NULL, local_day TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -375,6 +378,9 @@ class Store:
             school_cols = {r['name'] for r in db.execute('PRAGMA table_info(schools)')}
             if 'auto_absent' not in school_cols:
                 db.execute('ALTER TABLE schools ADD COLUMN auto_absent INTEGER NOT NULL DEFAULT 1')
+            event_cols = {r['name'] for r in db.execute('PRAGMA table_info(events)')}
+            if 'second_score' not in event_cols:
+                db.execute('ALTER TABLE events ADD COLUMN second_score REAL')
 
     # ------------------------------------------------------------------ audit
     def _audit(self, db, actor, school_id, action, detail=''):
@@ -1047,6 +1053,7 @@ class Store:
             verified = False
             review = 'none'
             confidence = None
+            second = None
             student_id = None
             if event_type == 'access_granted' and method in ('card', 'device_face') and camera['kind'] in ('entry', 'exit'):
                 verified, review = True, 'auto'
@@ -1054,9 +1061,13 @@ class Store:
                 if method != 'ai_face' or camera['kind'] == 'observe':
                     raise InputError('face_match requires verification_method=ai_face and a non-observe camera')
                 confidence = require_float(payload.get('confidence'), 'confidence', 0.0, 1.0)
+                if payload.get('second_score') is not None:
+                    second = require_float(payload.get('second_score'), 'second_score', 0.0, 1.0)
                 if confidence < school['face_review_threshold']:
                     return {'stored': False, 'reason': 'below_review_threshold'}
-                if confidence >= school['face_auto_threshold']:
+                if second is not None and second < SECOND_MODEL_REJECT:
+                    return {'stored': False, 'reason': 'second_model_reject'}
+                if confidence >= school['face_auto_threshold'] or (second is not None and second >= SECOND_MODEL_ACCEPT):
                     verified, review = True, 'auto'
                 else:
                     review = 'pending'
@@ -1070,8 +1081,8 @@ class Store:
                 method = 'none'
             try:
                 cur = db.execute('INSERT INTO events(school_id,event_uid,camera_id,student_id,event_type,verification_method,confidence,'
-                                 'review_status,verified,occurred_at,local_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                                 (sid, event_uid, camera['id'], student_id, event_type, method, confidence, review,
+                                 'second_score,review_status,verified,occurred_at,local_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                 (sid, event_uid, camera['id'], student_id, event_type, method, confidence, second, review,
                                   int(verified), iso(dt), local_day, iso(now_utc())))
             except sqlite3.IntegrityError:
                 return {'stored': False, 'duplicate': True, 'verified': False}
@@ -1082,7 +1093,7 @@ class Store:
         parse_day(day)
         with self.connect() as db:
             return [dict(r) for r in db.execute(
-                '''SELECT e.id,e.event_type,e.verification_method,e.confidence,e.review_status,e.verified,e.occurred_at,
+                '''SELECT e.id,e.event_type,e.verification_method,e.confidence,e.second_score,e.review_status,e.verified,e.occurred_at,
                    s.code AS student_code,s.full_name,cl.name AS class_name,c.name AS camera_name,c.room,c.kind AS camera_kind
                    FROM events e JOIN cameras c ON c.id=e.camera_id LEFT JOIN students s ON s.id=e.student_id
                    LEFT JOIN classes cl ON cl.id=s.class_id
@@ -1091,7 +1102,7 @@ class Store:
     def list_reviews(self, sid, limit=200):
         with self.connect() as db:
             rows = [dict(r) for r in db.execute(
-                '''SELECT e.id,e.confidence,e.occurred_at,e.local_day,s.id AS student_id,s.code AS student_code,s.full_name,
+                '''SELECT e.id,e.confidence,e.second_score,e.occurred_at,e.local_day,s.id AS student_id,s.code AS student_code,s.full_name,
                    cl.name AS class_name,c.name AS camera_name,c.room
                    FROM events e JOIN cameras c ON c.id=e.camera_id JOIN students s ON s.id=e.student_id
                    JOIN classes cl ON cl.id=s.class_id

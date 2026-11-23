@@ -2,3 +2,5 @@
 opencv-python>=4.8,<5
 numpy>=1.24,<3
 requests>=2.31,<3
+# Optional second-opinion model runtime (face_worker.py --download-verifier)
+onnxruntime>=1.17,<2

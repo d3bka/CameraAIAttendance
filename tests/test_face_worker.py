@@ -33,12 +33,33 @@ class FaceWorkerLogicTest(unittest.TestCase):
         c = fw.Confirmer(min_hits=3, window=10, cooldown=60)
         self.assertIsNone(c.observe('A', 0.6, 0))
         self.assertIsNone(c.observe('A', 0.5, 1))
-        self.assertAlmostEqual(c.observe('A', 0.7, 2), 0.6)
+        self.assertEqual(c.observe('A', 0.7, 2), (0.6, None))
         for t in (3, 4, 5):
             self.assertIsNone(c.observe('A', 0.9, t))   # cooldown
         self.assertIsNone(c.observe('B', 0.9, 0))
         self.assertIsNone(c.observe('B', 0.9, 20))      # first hit expired
         self.assertIsNone(c.observe('B', 0.9, 21))
+
+    def test_second_opinion_scores(self):
+        a, b = self.unit(1), self.unit(2)
+        a2, b2 = np.ones(512, np.float32) / np.sqrt(512), -np.ones(512, np.float32) / np.sqrt(512)
+        g = fw.Gallery()
+        g.rebuild([('A', a, a2), ('B', b, None), ('C', self.unit(3))])
+        self.assertAlmostEqual(g.verify('A', a2), 1.0, places=4)
+        self.assertAlmostEqual(g.verify('A', b2), -1.0, places=4)
+        self.assertIsNone(g.verify('B', a2))          # no second template for B -> no opinion
+        self.assertIsNone(g.verify('A', None))
+        c = fw.Confirmer(min_hits=2, window=10, cooldown=60)
+        self.assertIsNone(c.observe('A', 0.40, 0, 0.5))
+        conf, second = c.observe('A', 0.42, 1, 0.6)
+        self.assertAlmostEqual(conf, 0.41)
+        self.assertAlmostEqual(second, 0.55)
+
+    def test_verifier_is_optional(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(fw.load_verifier(Path(tmp)))                  # not installed -> worker runs without it
+            self.assertIsNone(fw.load_verifier(Path(tmp), disabled=True))
 
     def test_enrollment_quality(self):
         face = lambda w: [0, 0, w, w] + [0] * 11
