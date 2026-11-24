@@ -115,6 +115,7 @@ class Bot:
         self.stop = threading.Event()
         self.status = 'disabled'
         self.last_error = ''
+        self.conflicts = 0
 
     # ---------------------------------------------------------------- lifecycle
     def start(self):
@@ -141,36 +142,45 @@ class Bot:
                 self.store.set_setting('telegram_enabled', '')
                 self.api, self.status, self.last_error = None, 'error', 'Токен принадлежит другому боту — включите заново'
                 return False
-            self.status = 'running'
+            self.status = 'starting'
         return True
+
+    def poll_once(self):
+        """One getUpdates round. Returns seconds to wait before the next round (0 = immediately)."""
+        try:
+            if not self._ensure_api():
+                return 15
+            resp = self.api.call('getUpdates', http_timeout=35, offset=self.offset, timeout=25, allowed_updates=['message'])
+            if not resp.get('ok'):
+                if resp.get('error_code') == 409:
+                    self.conflicts += 1
+                    LOG.warning('Telegram 409 Conflict #%d: another program is polling this bot', self.conflicts)
+                    self.status, self.last_error = 'error', 'Этот бот уже используется другой программой (409 Conflict)'
+                else:
+                    self.last_error = resp.get('description', 'getUpdates failed')
+                return 30
+            if self.status != 'running':
+                LOG.info('Telegram bot @%s is polling', self.username)
+            self.status, self.last_error = 'running', ''  # (re)covered: notifications resume
+            for update in resp.get('result', []):
+                self.offset = update['update_id'] + 1
+                try:
+                    self.handle_update(update)
+                except Exception:
+                    LOG.exception('update handling failed')
+            return 0
+        except ConnectionError as exc:
+            self.last_error = f'Нет связи с Telegram ({exc})'
+            return 10
+        except Exception:
+            LOG.exception('telegram poll loop error')
+            return 10
 
     def _poll_loop(self):
         while not self.stop.is_set():
-            try:
-                if not self._ensure_api():
-                    self.stop.wait(15)
-                    continue
-                resp = self.api.call('getUpdates', http_timeout=35, offset=self.offset, timeout=25,
-                                     allowed_updates=['message'])
-                if not resp.get('ok'):
-                    if resp.get('error_code') == 409:
-                        self.status, self.last_error = 'error', 'Этот бот уже используется другой программой (409 Conflict)'
-                    else:
-                        self.last_error = resp.get('description', 'getUpdates failed')
-                    self.stop.wait(30)
-                    continue
-                for update in resp.get('result', []):
-                    self.offset = update['update_id'] + 1
-                    try:
-                        self.handle_update(update)
-                    except Exception:
-                        LOG.exception('update handling failed')
-            except ConnectionError as exc:
-                self.last_error = f'Нет связи с Telegram ({exc})'
-                self.stop.wait(10)
-            except Exception:
-                LOG.exception('telegram poll loop error')
-                self.stop.wait(10)
+            wait = self.poll_once()
+            if wait:
+                self.stop.wait(wait)
 
     def _notify_loop(self):
         while not self.stop.is_set():

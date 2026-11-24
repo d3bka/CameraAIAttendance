@@ -134,6 +134,15 @@ class TelegramTests(unittest.TestCase):
         self.assertIn('отписаны', self.api.sent[-1][1])
         self.assertEqual(self.store.tg_subscribers(self.sid)['parents'], {})
 
+    def test_recovers_after_conflict(self):
+        answers = [{'ok': False, 'error_code': 409, 'description': 'Conflict'}, {'ok': True, 'result': []}]
+        orig = self.api.call
+        self.api.call = lambda method, **p: answers.pop(0) if method == 'getUpdates' else orig(method, **p)
+        self.assertEqual(self.bot.poll_once(), 30)
+        self.assertEqual((self.bot.status, self.bot.conflicts), ('error', 1))
+        self.assertEqual(self.bot.poll_once(), 0)
+        self.assertEqual((self.bot.status, self.bot.last_error), ('running', ''))   # notifications resume
+
     def test_disabled_and_token_swap(self):
         self.store.set_setting('telegram_enabled', '')
         self.assertFalse(self.bot._ensure_api())
