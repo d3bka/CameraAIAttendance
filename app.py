@@ -24,6 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import imports
+import summaries
 import telegram_bot
 from core import Forbidden, InputError, NotFound, Store, local_today, TZ_NAME
 
@@ -81,6 +82,7 @@ class ApiServer(ThreadingHTTPServer):
         self.trust_proxy = trust_proxy
         self.throttle = LoginThrottle()
         self.form_throttle = LoginThrottle(limit=5, window=3600)
+        self.summary_throttle = LoginThrottle(limit=10, window=3600)
         super().__init__(address, Handler)
 
 
@@ -684,6 +686,23 @@ def _token_loader(h):
     return getattr(h.server, 'telegram_token_loader', lambda: None)()
 
 
+@route('GET', r'/api/s/(\d{1,9})/summary', 'staff')
+def summary_get(h, sid):
+    return {'summary': h.server.store.get_summary(sid, h.query('date') or local_today()),
+            'ai_available': bool(getattr(h.server, 'deepseek_key_loader', lambda: None)())}
+
+
+@route('POST', r'/api/s/(\d{1,9})/summary', 'staff')
+def summary_generate(h, sid):
+    key = f'summary:{sid}'
+    if h.server.summary_throttle.blocked(key):
+        raise InputError('Не больше 10 сводок в час — попробуйте позже')
+    h.server.summary_throttle.fail(key)
+    day = h.body.get('date') or local_today()
+    api_key = getattr(h.server, 'deepseek_key_loader', lambda: None)()
+    return summaries.generate(h.server.store, sid, day, api_key, getattr(h.server, 'deepseek_model', summaries.DEFAULT_MODEL))
+
+
 @route('GET', r'/api/telegram', 'super')
 def telegram_status(h):
     bot = getattr(h.server, 'bot', None)
@@ -852,8 +871,21 @@ def main(argv=None):
         except OSError:
             return None
 
+    key_file = db.parent / 'deepseek_key.txt'
+
+    def load_deepseek_key():
+        if os.environ.get('ATTENDANCE_DEEPSEEK_KEY'):
+            return os.environ['ATTENDANCE_DEEPSEEK_KEY'].strip()
+        try:
+            return key_file.read_text(encoding='utf-8-sig').strip() or None
+        except OSError:
+            return None
+
+    server.deepseek_key_loader = load_deepseek_key
+    server.deepseek_model = os.environ.get('ATTENDANCE_DEEPSEEK_MODEL', summaries.DEFAULT_MODEL)
     server.telegram_token_loader = load_token
-    server.bot = telegram_bot.Bot(store, load_token)
+    server.bot = telegram_bot.Bot(store, load_token, summary_fn=lambda sid, day: summaries.generate(
+        store, sid, day, load_deepseek_key(), server.deepseek_model))
     server.bot.start()  # stays idle until a superadmin enables it in the panel
     print(f'Camera Attendance AI → http://{args.host}:{args.port}', flush=True)
     try:

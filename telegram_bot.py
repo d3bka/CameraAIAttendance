@@ -42,6 +42,7 @@ TEXT = {
         'camera_down': '⚠️ Камера «{camera}» не работает во время урока {cls} «{lesson}» ({slot}). Отметьте посещаемость вручную.',
         'status_line': '{name}: {status}',
         'lang_set': 'Язык: русский',
+        'summary': '📊 Сводка посещаемости за {day}\n\n{text}',
         'group_only_admin': 'Команда работает только в группе.',
     },
     'uz': {
@@ -60,6 +61,7 @@ TEXT = {
         'camera_down': '⚠️ «{camera}» kamerasi {cls} «{lesson}» darsi ({slot}) vaqtida ishlamayapti. Davomatni qo‘lda belgilang.',
         'status_line': '{name}: {status}',
         'lang_set': 'Til: o‘zbekcha',
+        'summary': '📊 {day} davomat hisoboti (rus tilida)\n\n{text}',
         'group_only_admin': 'Buyruq faqat guruhda ishlaydi.',
     },
 }
@@ -102,8 +104,9 @@ class TelegramAPI:
 
 
 class Bot:
-    def __init__(self, store, token_loader, api_factory=TelegramAPI):
+    def __init__(self, store, token_loader, api_factory=TelegramAPI, summary_fn=None):
         self.store = store
+        self.summary_fn = summary_fn  # (school_id, day) -> {'text', ...}; daily report for staff chats
         self.token_loader = token_loader
         self.api_factory = api_factory
         self.api = None
@@ -234,7 +237,10 @@ class Bot:
     def run_notifications(self, now=None):
         """One pass: turn today's attendance into parent/staff messages exactly once."""
         sent = 0
-        for item in self.store.tg_pending_notifications(now):
+        items = list(self.store.tg_pending_notifications(now))
+        if self.summary_fn is not None:
+            items += self.daily_summaries(now)
+        for item in items:
             chat_id, lang, key, fields = item
             text = t(lang, key, **fields)
             if self.store.tg_mark_sent(item_key := fields['_dedupe'] + f':{chat_id}'):
@@ -243,3 +249,24 @@ class Bot:
                 else:
                     self.store.tg_unmark_sent(item_key)
         return sent
+
+    def daily_summaries(self, now=None):
+        """Once per school day, at the school's summary_time, a report for staff chats and groups."""
+        now = now or now_utc()
+        local = now.astimezone(TZ)
+        day = local.date().isoformat()
+        out = []
+        for sid, chats in self.store.tg_staff_chats().items():
+            school = self.store.get_school(sid)
+            if local.strftime('%H:%M') < school.get('summary_time', '15:00'):
+                continue
+            key = f'sum:{sid}:{day}'
+            pending = [(chat, lang) for chat, lang in chats if not self.store.tg_was_sent(f'{key}:{chat}')]
+            if not pending:
+                continue
+            summary = self.store.get_summary(sid, day) or self.summary_fn(sid, day)
+            if 'уроков по расписанию не было' in summary['text']:
+                continue
+            for chat, lang in pending:
+                out.append((chat, lang, 'summary', {'day': day, 'text': summary['text'], '_dedupe': key}))
+        return out

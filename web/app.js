@@ -529,15 +529,19 @@ pages.cameras = async () => {
     h('button', { class: 'btn primary', type: 'submit' }, 'Добавить камеру')), async (data, f) => { await api(sPath('/cameras'), 'POST', data); f.reset(); toast('Камера добавлена'); refresh(); }) : null;
   const settings = isAdmin() && school ? submitting(h('form', {},
     field('Опоздание после начала урока, мин', input('late_grace_min', { type: 'number', min: 0, max: 60, value: school.late_grace_min })),
-    field('Авто-отметка при уверенности от', input('face_auto_threshold', { type: 'number', step: '0.01', min: 0.3, max: 0.95, value: school.face_auto_threshold })),
-    field('На проверку учителю при уверенности от', input('face_review_threshold', { type: 'number', step: '0.01', min: 0.2, max: 0.95, value: school.face_review_threshold })),
+    field('Авто-отметка при уверенности от', input('face_auto_threshold', { type: 'number', step: 'any', min: 0.3, max: 0.95, value: school.face_auto_threshold })),
+    field('На проверку учителю при уверенности от', input('face_review_threshold', { type: 'number', step: 'any', min: 0.2, max: 0.95, value: school.face_review_threshold })),
     h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'auto_absent', checked: !!school.auto_absent }),
       h('span', {}, 'Автоматически ставить «Отсутствует», если камера работала весь урок, а ребёнка не было в кадре')),
     h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'auto_learn', checked: school.auto_learn !== 0 }),
       h('span', {}, 'Самообучение: AI сам добавляет до 3 удачных кадров ребёнка с камеры, когда уверенно его узнал (точность растёт со временем)')),
+    field('Время ежедневной сводки для директора (Telegram)', input('summary_time', { type: 'time', value: school.summary_time || '15:00' })),
+    h('label', { class: 'checkbox-row' }, h('input', { type: 'checkbox', name: 'ai_summaries', checked: school.ai_summaries !== 0 }),
+      h('span', {}, 'Сводку пишет AI (DeepSeek). В сервис уходят только обезличенные цифры, без имён и фото')),
     h('button', { class: 'btn primary', type: 'submit' }, 'Сохранить')), async data => {
     await api(`/api/s/${state.sid}`, 'PUT', { late_grace_min: Number(data.late_grace_min), face_auto_threshold: Number(data.face_auto_threshold),
-      face_review_threshold: Number(data.face_review_threshold), auto_absent: data.auto_absent, auto_learn: data.auto_learn });
+      face_review_threshold: Number(data.face_review_threshold), auto_absent: data.auto_absent, auto_learn: data.auto_learn,
+      summary_time: data.summary_time, ai_summaries: data.ai_summaries });
     toast('Настройки сохранены');
   }) : null;
   return h('div', {}, heading('DEVICES & AI', 'Камеры и распознавание', 'Каждая камера в классе обслуживается AI-воркером, который шлёт распознавания и сигнал «я работаю» раз в минуту.'),

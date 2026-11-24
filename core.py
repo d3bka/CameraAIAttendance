@@ -237,6 +237,8 @@ CREATE TABLE IF NOT EXISTS schools (
     late_grace_min INTEGER NOT NULL DEFAULT 10,
     auto_absent INTEGER NOT NULL DEFAULT 1,
     auto_learn INTEGER NOT NULL DEFAULT 1,
+    ai_summaries INTEGER NOT NULL DEFAULT 1,
+    summary_time TEXT NOT NULL DEFAULT '15:00',
     face_auto_threshold REAL NOT NULL DEFAULT 0.45,
     face_review_threshold REAL NOT NULL DEFAULT 0.363,
     created_at TEXT NOT NULL
@@ -331,6 +333,10 @@ CREATE TABLE IF NOT EXISTS applications (
     ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, decided_at TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS summaries (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE, day TEXT NOT NULL,
+    text TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (school_id, day)
+);
 CREATE TABLE IF NOT EXISTS tg_codes (
     code_hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('parent','staff','group')),
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
@@ -419,6 +425,10 @@ class Store:
                 db.execute('ALTER TABLE schools ADD COLUMN auto_absent INTEGER NOT NULL DEFAULT 1')
             if 'auto_learn' not in school_cols:
                 db.execute('ALTER TABLE schools ADD COLUMN auto_learn INTEGER NOT NULL DEFAULT 1')
+            if 'ai_summaries' not in school_cols:
+                db.execute('ALTER TABLE schools ADD COLUMN ai_summaries INTEGER NOT NULL DEFAULT 1')
+            if 'summary_time' not in school_cols:
+                db.execute("ALTER TABLE schools ADD COLUMN summary_time TEXT NOT NULL DEFAULT '15:00'")
             photo_cols = {r['name'] for r in db.execute('PRAGMA table_info(photos)')}
             if 'source' not in photo_cols:
                 db.execute("ALTER TABLE photos ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
@@ -512,6 +522,12 @@ class Store:
                            'face_review_threshold=? WHERE id=?', (name, city, grace, auto_absent, auto_learn, auto, review, sid))
             except sqlite3.IntegrityError:
                 raise InputError('Школа с таким названием уже существует') from None
+            if 'summary_time' in payload:
+                db.execute('UPDATE schools SET summary_time=? WHERE id=?', (require_hhmm(payload['summary_time'], 'Время сводки'), sid))
+            if 'ai_summaries' in payload:
+                if payload['ai_summaries'] not in (True, False, 0, 1):
+                    raise InputError('ai_summaries: true или false')
+                db.execute('UPDATE schools SET ai_summaries=? WHERE id=?', (int(payload['ai_summaries']), sid))
             self._audit(db, actor, sid, 'school.update', f'grace={grace} auto={auto} review={review} auto_absent={auto_absent}')
             return self._school(db, sid)
 
@@ -1884,3 +1900,28 @@ class Store:
             self.delete_photo(sid, autos[0]['id'])
         res = self.add_photo(sid, st['id'], data, {'username': 'ai-worker'}, source='auto')
         return {'stored': True, 'id': res['id']}
+
+    # ------------------------------------------------------------------ daily summaries
+    def save_summary(self, sid, day, text, source):
+        with self.connect() as db:
+            db.execute('INSERT INTO summaries(school_id,day,text,source,created_at) VALUES(?,?,?,?,?) '
+                       'ON CONFLICT(school_id,day) DO UPDATE SET text=excluded.text, source=excluded.source, created_at=excluded.created_at',
+                       (sid, day, text, source, iso(now_utc())))
+
+    def get_summary(self, sid, day):
+        parse_day(day)
+        with self.connect() as db:
+            row = db.execute('SELECT day,text,source,created_at FROM summaries WHERE school_id=? AND day=?', (sid, day)).fetchone()
+        return dict(row) if row else None
+
+    def tg_staff_chats(self):
+        """{school_id: [(chat_id, lang), ...]} of active staff/group subscriptions."""
+        out = {}
+        with self.connect() as db:
+            for r in db.execute("SELECT school_id, chat_id, lang FROM tg_links WHERE active=1 AND kind IN ('staff','group')"):
+                out.setdefault(r['school_id'], []).append((r['chat_id'], r['lang']))
+        return out
+
+    def tg_was_sent(self, key):
+        with self.connect() as db:
+            return db.execute('SELECT 1 FROM tg_sent WHERE key=?', (key,)).fetchone() is not None

@@ -519,3 +519,30 @@ pages.users = async () => {
     } }, 'Подключить группу'), out));
   return node;
 };
+
+
+/* ------------------------------------------------------------------ daily summary (AI or template) */
+const _overviewWithChecklist = pages.overview;
+pages.overview = async () => {
+  const node = await _overviewWithChecklist();
+  if (!state.sid) return node;
+  const date = state.cache.date || state.today;
+  let data;
+  try { data = await api(sPath('/summary?date=' + date)); } catch { return node; }
+  const body = h('div', { class: 'summary-text' });
+  const meta = h('small', { class: 'hint' });
+  const show = sm => {
+    body.textContent = sm ? sm.text : 'Сводка за этот день ещё не сформирована.';
+    meta.textContent = sm ? `${sm.source === 'deepseek' ? 'Написано AI (DeepSeek)' : 'Сводка по шаблону'}${sm.created_at ? ' · ' + fmtDateTime(sm.created_at) : ''}` : '';
+  };
+  show(data.summary);
+  const btn = h('button', { class: 'btn secondary small', type: 'button', onclick: async () => {
+    btn.disabled = true; body.textContent = 'Формирую сводку…';
+    try { show(await api(sPath('/summary'), 'POST', { date })); } catch (e) { toast(e.message, true); show(data.summary); }
+    finally { btn.disabled = false; }
+  } }, data.summary ? '↻ Обновить сводку' : '✦ Сформировать сводку');
+  node.insertBefore(panel(h('div', { class: 'panel-title-row' }, h('h2', {}, 'Сводка дня для директора'), btn), body, meta,
+    h('p', { class: 'hint' }, data.ai_available ? 'В DeepSeek передаются только обезличенные цифры: имена заменяются на «Ученик#N» и подставляются обратно на нашем сервере.'
+      : 'AI-ключ не настроен — сводка составляется по шаблону.')), node.querySelector('.twocol'));
+  return node;
+};

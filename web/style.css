@@ -103,3 +103,5 @@ a.mini-btn{text-decoration:none;display:inline-block}
 .q-btn{width:40px;height:40px;border-radius:10px;border:1px solid #30415d;background:#1a2a40;color:#dbe7f7;font-weight:800;font-size:15px}
 .q-btn.on{background:#297fd6;border-color:#297fd6}.q-btn:disabled{opacity:.4}
 .mobile-att .panel{padding:14px}
+
+.summary-text{white-space:pre-wrap;line-height:1.7;color:#d6e2f3;font-size:14px;margin-bottom:8px}
