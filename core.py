@@ -54,6 +54,7 @@ MIN_CAMERA_COVERAGE = 0.6
 AGGREGATE_PENDING_HITS = 2
 SECOND_MODEL_ACCEPT = 0.40  # second-opinion model (ArcFace) agrees -> accept
 SECOND_MODEL_REJECT = 0.20  # second-opinion model disagrees -> drop the match
+LIVENESS_SUSPECT = 0.5      # anti-spoofing: below this the sighting goes to a human (possible photo/screen)
 ENTRY_WINDOW_BEFORE = timedelta(minutes=90)
 ENTRY_WINDOW_AFTER = timedelta(minutes=30)
 PBKDF2_ITERATIONS = int(os.environ.get('ATTENDANCE_PBKDF2_ITERATIONS', '600000'))
@@ -297,6 +298,7 @@ CREATE TABLE IF NOT EXISTS events (
     student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
     event_type TEXT NOT NULL, verification_method TEXT NOT NULL, confidence REAL,
     second_score REAL,
+    liveness REAL,
     review_status TEXT NOT NULL DEFAULT 'none', verified INTEGER NOT NULL DEFAULT 0,
     reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     occurred_at TEXT NOT NULL, local_day TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -435,6 +437,8 @@ class Store:
             event_cols = {r['name'] for r in db.execute('PRAGMA table_info(events)')}
             if 'second_score' not in event_cols:
                 db.execute('ALTER TABLE events ADD COLUMN second_score REAL')
+            if 'liveness' not in event_cols:
+                db.execute('ALTER TABLE events ADD COLUMN liveness REAL')
 
     # ------------------------------------------------------------------ audit
     def _audit(self, db, actor, school_id, action, detail=''):
@@ -1127,6 +1131,7 @@ class Store:
             review = 'none'
             confidence = None
             second = None
+            live = None
             student_id = None
             if event_type == 'access_granted' and method in ('card', 'device_face') and camera['kind'] in ('entry', 'exit'):
                 verified, review = True, 'auto'
@@ -1140,10 +1145,14 @@ class Store:
                     return {'stored': False, 'reason': 'below_review_threshold'}
                 if second is not None and second < SECOND_MODEL_REJECT:
                     return {'stored': False, 'reason': 'second_model_reject'}
+                if payload.get('liveness') is not None:
+                    live = require_float(payload.get('liveness'), 'liveness', 0.0, 1.0)
                 if confidence >= school['face_auto_threshold'] or (second is not None and second >= SECOND_MODEL_ACCEPT):
                     verified, review = True, 'auto'
                 else:
                     review = 'pending'
+                if live is not None and live < LIVENESS_SUSPECT:
+                    verified, review = False, 'pending'  # possible photo or phone screen: never auto-mark
             if event_type in ('access_granted', 'face_match') and (verified or review == 'pending'):
                 code = require_code(payload.get('person_code'), 'person_code')
                 st = db.execute('SELECT id FROM students WHERE code=? AND school_id=?', (code, sid)).fetchone()
@@ -1154,8 +1163,8 @@ class Store:
                 method = 'none'
             try:
                 cur = db.execute('INSERT INTO events(school_id,event_uid,camera_id,student_id,event_type,verification_method,confidence,'
-                                 'second_score,review_status,verified,occurred_at,local_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                                 (sid, event_uid, camera['id'], student_id, event_type, method, confidence, second, review,
+                                 'second_score,liveness,review_status,verified,occurred_at,local_day,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                 (sid, event_uid, camera['id'], student_id, event_type, method, confidence, second, live, review,
                                   int(verified), iso(dt), local_day, iso(now_utc())))
             except sqlite3.IntegrityError:
                 return {'stored': False, 'duplicate': True, 'verified': False}
@@ -1166,7 +1175,7 @@ class Store:
         parse_day(day)
         with self.connect() as db:
             return [dict(r) for r in db.execute(
-                '''SELECT e.id,e.event_type,e.verification_method,e.confidence,e.second_score,e.review_status,e.verified,e.occurred_at,
+                '''SELECT e.id,e.event_type,e.verification_method,e.confidence,e.second_score,e.liveness,e.review_status,e.verified,e.occurred_at,
                    s.code AS student_code,s.full_name,cl.name AS class_name,c.name AS camera_name,c.room,c.kind AS camera_kind
                    FROM events e JOIN cameras c ON c.id=e.camera_id LEFT JOIN students s ON s.id=e.student_id
                    LEFT JOIN classes cl ON cl.id=s.class_id
@@ -1175,7 +1184,7 @@ class Store:
     def list_reviews(self, sid, limit=200):
         with self.connect() as db:
             rows = [dict(r) for r in db.execute(
-                '''SELECT e.id,e.confidence,e.second_score,e.occurred_at,e.local_day,s.id AS student_id,s.code AS student_code,s.full_name,
+                '''SELECT e.id,e.confidence,e.second_score,e.liveness,e.occurred_at,e.local_day,s.id AS student_id,s.code AS student_code,s.full_name,
                    cl.name AS class_name,c.name AS camera_name,c.room
                    FROM events e JOIN cameras c ON c.id=e.camera_id JOIN students s ON s.id=e.student_id
                    JOIN classes cl ON cl.id=s.class_id

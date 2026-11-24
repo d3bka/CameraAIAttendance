@@ -237,8 +237,14 @@ class IngestTests(Base):
         self.assertEqual(r['review_status'], 'pending')
         with self.assertRaises(InputError):
             self.store.ingest(self.a, {**base, 'event_uid': 's4', 'confidence': 0.40, 'second_score': 1.5})
+        # anti-spoofing: even a very confident match goes to a human if it may be a photo / phone screen
+        r = self.store.ingest(self.a, {**base, 'event_uid': 's5', 'confidence': 0.90, 'second_score': 0.80, 'liveness': 0.2})
+        self.assertEqual((r['verified'], r['review_status']), (False, 'pending'))
+        r = self.store.ingest(self.a, {**base, 'event_uid': 's6', 'confidence': 0.90, 'liveness': 0.97})
+        self.assertEqual((r['verified'], r['review_status']), (True, 'auto'))
         ev = {e['id']: e for e in self.store.list_events(self.a, core.local_today())}
-        self.assertEqual(sorted(e['second_score'] for e in ev.values()), [0.30, 0.55])
+        self.assertEqual(sorted(e['second_score'] for e in ev.values() if e['second_score'] is not None), [0.30, 0.55, 0.80])
+        self.assertEqual([r['liveness'] for r in self.store.list_reviews(self.a) if r['liveness'] is not None], [0.2])
 
     def test_review_flow(self):
         eid = self.face('S2', datetime.now(timezone.utc), 0.40)['id']

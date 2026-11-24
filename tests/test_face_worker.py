@@ -33,7 +33,7 @@ class FaceWorkerLogicTest(unittest.TestCase):
         c = fw.Confirmer(min_hits=3, window=10, cooldown=60)
         self.assertIsNone(c.observe('A', 0.6, 0))
         self.assertIsNone(c.observe('A', 0.5, 1))
-        self.assertEqual(c.observe('A', 0.7, 2), (0.6, None))
+        self.assertEqual(c.observe('A', 0.7, 2), (0.6, None, None))
         for t in (3, 4, 5):
             self.assertIsNone(c.observe('A', 0.9, t))   # cooldown
         self.assertIsNone(c.observe('B', 0.9, 0))
@@ -51,9 +51,12 @@ class FaceWorkerLogicTest(unittest.TestCase):
         self.assertIsNone(g.verify('A', None))
         c = fw.Confirmer(min_hits=2, window=10, cooldown=60)
         self.assertIsNone(c.observe('A', 0.40, 0, 0.5))
-        conf, second = c.observe('A', 0.42, 1, 0.6)
+        conf, second, live = c.observe('A', 0.42, 1, 0.6)
         self.assertAlmostEqual(conf, 0.41)
         self.assertAlmostEqual(second, 0.55)
+        self.assertIsNone(live)
+        c.observe('B', 0.6, 0, None, 0.95)
+        self.assertAlmostEqual(c.observe('B', 0.6, 1, None, 0.30)[2], 0.30)   # worst frame decides
 
     def test_verifier_is_optional(self):
         import tempfile
@@ -109,6 +112,31 @@ class FaceWorkerLogicTest(unittest.TestCase):
         shared.auto_learn = False
         self.assertFalse(w.maybe_learn('D', 0.62, 0.70, frame, face, aligned))   # school switched it off
         self.assertEqual(FakePlatform.uploads, ['A', 'C'])
+
+    def test_liveness_model(self):
+        path = fw.ROOT / 'models' / fw.LIVENESS[0]
+        if not path.exists():
+            self.skipTest('anti-spoofing model not downloaded')
+        model = fw.Liveness(path)
+        rng = np.random.default_rng(1)
+        img = rng.integers(0, 255, (400, 400, 3), dtype=np.uint8)
+        p = model.real_prob(img, np.array([150, 150, 100, 100] + [0] * 11, dtype=np.float32))
+        self.assertTrue(0.0 <= p <= 1.0)
+        p_edge = model.real_prob(img, np.array([350, 350, 100, 100] + [0] * 11, dtype=np.float32))  # crop clamped at border
+        self.assertTrue(0.0 <= p_edge <= 1.0)
+
+    def test_no_learning_from_possible_spoof(self):
+        shared = fw.SharedGallery()
+        shared.auto_learn = True
+        w = object.__new__(fw.CameraWorker)
+        w.shared, w.camera_key = shared, 'room'
+        w.platform = type('P', (), {'auto_photo': lambda self, c, d: True})()
+        rng = np.random.default_rng(0)
+        frame = rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+        aligned = rng.integers(0, 255, (112, 112, 3), dtype=np.uint8)
+        face = np.array([500, 200, 120, 150] + [0] * 11, dtype=np.float32)
+        self.assertFalse(w.maybe_learn('A', 0.62, None, frame, face, aligned, live=0.2))
+        self.assertTrue(w.maybe_learn('A', 0.62, None, frame, face, aligned, live=0.9))
 
     def test_enrollment_quality(self):
         face = lambda w: [0, 0, w, w] + [0] * 11

@@ -65,6 +65,12 @@ VERIFIER = ('w600k_r50.onnx', 'https://github.com/deepinsight/insightface/releas
             '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43')
 VERIFIER_ACCEPT = 0.40   # ArcFace cosine: same person with high probability
 VERIFIER_REJECT = 0.20   # ArcFace cosine: almost certainly a different person -> veto
+# Anti-spoofing (photo / phone screen held up to the camera): MiniFASNet V2, Apache-2.0
+# (minivision-ai/Silent-Face-Anti-Spoofing, ONNX packaged by yakhyo/uniface-weights).
+LIVENESS = ('minifasnet_v2.onnx', 'https://huggingface.co/yakhyo/uniface-weights/resolve/main/minifasnet_v2.onnx',
+            'b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907')
+LIVENESS_MIN_FACE = 60       # below this the model is not reliable on CCTV images -> no opinion
+LIVENESS_SUSPECT = 0.5       # P(real) below this: flag the sighting for a human instead of auto-marking
 LEARN_MIN_SCORE = 0.55       # self-learning: main model must be confident ...
 LEARN_MIN_SECOND = 0.50      # ... and the second model must agree
 LEARN_MAX_SIMILARITY = 0.85  # skip views that are almost identical to existing references
@@ -248,6 +254,56 @@ class Verifier:
         return feature / norm if norm else feature
 
 
+class Liveness:
+    """P(real face) for a detected face; crop/scale exactly as the Silent-Face MiniFASNet V2 expects."""
+
+    def __init__(self, path: Path, scale=2.7):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        self.session = ort.InferenceSession(str(path), opts, providers=['CPUExecutionProvider'])
+        self.input = self.session.get_inputs()[0].name
+        self.size = tuple(self.session.get_inputs()[0].shape[2:4][::-1])
+        self.scale = scale
+
+    def real_prob(self, image, face):
+        x, y, w, h = (float(v) for v in face[:4])
+        H, W = image.shape[:2]
+        scale = min((H - 1) / max(h, 1), (W - 1) / max(w, 1), self.scale)
+        cx, cy = x + w / 2, y + h / 2
+        x1, y1 = max(0, int(cx - w * scale / 2)), max(0, int(cy - h * scale / 2))
+        x2, y2 = min(W - 1, int(cx + w * scale / 2)), min(H - 1, int(cy + h * scale / 2))
+        crop = cv2.resize(image[y1:y2 + 1, x1:x2 + 1], self.size).astype(np.float32).transpose(2, 0, 1)[None]
+        logits = self.session.run(None, {self.input: crop})[0][0]
+        p = np.exp(logits - logits.max())
+        return float(p[1] / p.sum())  # class 1 = live; 0 and 2 = print / replay attacks
+
+
+def load_liveness(models_dir: Path, download=False, disabled=False):
+    if disabled:
+        return None
+    name, url, digest = LIVENESS
+    path = models_dir / name
+    if not path.exists():
+        if not download:
+            LOG.info('Anti-spoofing model not installed (optional): python face_worker.py --download-models')
+            return None
+        models_dir.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, timeout=60) as resp:
+            resp.raise_for_status()
+            path.write_bytes(resp.content)
+    if file_sha256(path) != digest:
+        path.unlink(missing_ok=True)
+        raise SystemExit(f'Checksum mismatch for {name}; file removed. Re-run --download-models.')
+    try:
+        model = Liveness(path)
+    except ImportError:
+        LOG.warning('onnxruntime is not installed; anti-spoofing disabled (pip install onnxruntime)')
+        return None
+    LOG.info('Anti-spoofing enabled: %s (suspect below %.2f, faces >= %d px)', name, LIVENESS_SUSPECT, LIVENESS_MIN_FACE)
+    return model
+
+
 def load_verifier(models_dir: Path, path=None, download=False, disabled=False):
     """Return a Verifier or None (the worker runs fine without it)."""
     if disabled:
@@ -362,10 +418,10 @@ class Confirmer:
         self.hits: dict[str, collections.deque] = {}
         self.last_sent: dict[str, float] = {}
 
-    def observe(self, code: str, score: float, now: float, second: float | None = None):
-        """Returns None, or (median main score, median second-model score or None) when confirmed."""
+    def observe(self, code: str, score: float, now: float, second: float | None = None, live: float | None = None):
+        """Returns None, or (median score, median second-model score|None, min liveness|None) when confirmed."""
         q = self.hits.setdefault(code, collections.deque())
-        q.append((now, score, second))
+        q.append((now, score, second, live))
         while q and now - q[0][0] > self.window:
             q.popleft()
         if len(q) < self.min_hits:
@@ -373,10 +429,12 @@ class Confirmer:
         if now - self.last_sent.get(code, -1e9) < self.cooldown:
             return None
         self.last_sent[code] = now
-        confidence = statistics.median(s for _, s, _ in q)
-        seconds = [s2 for _, _, s2 in q if s2 is not None]
+        confidence = statistics.median(x[1] for x in q)
+        seconds = [x[2] for x in q if x[2] is not None]
+        lives = [x[3] for x in q if x[3] is not None]
         q.clear()
-        return confidence, (statistics.median(seconds) if seconds else None)
+        # liveness: the WORST frame counts - one clear photo/screen frame is enough to ask a human
+        return confidence, (statistics.median(seconds) if seconds else None), (min(lives) if lives else None)
 
 
 # --------------------------------------------------------------------------- I/O
@@ -479,12 +537,14 @@ class Platform:
         except requests.RequestException as exc:
             LOG.warning('[%s] heartbeat failed: %s', self.camera_key, type(exc).__name__)
 
-    def send_match(self, code, confidence, second=None):
+    def send_match(self, code, confidence, second=None, live=None):
         event = {'camera_key': self.camera_key, 'event_uid': 'face-' + uuid.uuid4().hex,
                  'event_type': 'face_match', 'verification_method': 'ai_face', 'person_code': code,
                  'confidence': round(float(confidence), 4), 'observed_at': datetime.now(timezone.utc).isoformat()}
         if second is not None:
             event['second_score'] = round(min(1.0, max(0.0, float(second))), 4)
+        if live is not None:
+            event['liveness'] = round(min(1.0, max(0.0, float(live))), 4)
         self.outbox.append(event)
         self.flush()
 
@@ -516,6 +576,7 @@ class SharedGallery:
         self.review_threshold = 0.363
         self.verifier: Verifier | None = None
         self.pins: CameraPins | None = None
+        self.liveness: Liveness | None = None
         self.auto_learn = False
         self.learned: dict[str, str] = {}  # student code -> date of the last camera-learned photo
 
@@ -694,11 +755,16 @@ class CameraWorker(threading.Thread):
                 if second is not None and second < VERIFIER_REJECT:
                     self.stats['vetoed'] += 1  # the stronger model says: not this child
                     continue
-            confirmed = self.confirmer.observe(code, score, time.monotonic(), second)
+            live = None
+            if self.shared.liveness is not None and face[2] >= LIVENESS_MIN_FACE:
+                live = self.shared.liveness.real_prob(frame, face)
+                if live < LIVENESS_SUSPECT:
+                    self.stats['spoof_suspect'] += 1
+            confirmed = self.confirmer.observe(code, score, time.monotonic(), second, live)
             if confirmed is not None:
                 self.stats['matches'] += 1
                 self.platform.send_match(code, *confirmed)
-                self.maybe_learn(code, score, second, frame, face, crop)
+                self.maybe_learn(code, score, second, frame, face, crop, confirmed[2])
         if args.show:
             preview = frame.copy()
             for face in faces:
@@ -708,8 +774,10 @@ class CameraWorker(threading.Thread):
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
 
-    def maybe_learn(self, code, score, second, frame, face, aligned):
+    def maybe_learn(self, code, score, second, frame, face, aligned, live=None):
         """Add a new reference photo only when we are sure who it is AND the view adds information."""
+        if live is not None and live < LIVENESS_SUSPECT:
+            return False  # never learn from a possible photo/screen
         today = datetime.now().date().isoformat()
         sure = score >= LEARN_MIN_SCORE and (self.shared.verifier is None or (second is not None and second >= LEARN_MIN_SECOND))
         novel = score < LEARN_MAX_SIMILARITY  # near-duplicates of existing references teach nothing
@@ -775,6 +843,7 @@ def run(args):
     shared = SharedGallery()
     shared.verifier = load_verifier(Path(args.models_dir), args.verifier, args.download_verifier, args.no_verifier)
     shared.pins = CameraPins(pins_path(args), enabled=not args.no_pin)
+    shared.liveness = load_liveness(Path(args.models_dir), args.download_models, args.no_liveness)
     shared.auto_learn_disabled = args.no_auto_learn
     while True:  # the platform may still be starting (e.g. both launched at Windows logon)
         try:
@@ -858,6 +927,7 @@ def main(argv=None):
     parser.add_argument('--download-verifier', action='store_true', help='Download ArcFace R50 (InsightFace, non-commercial licence)')
     parser.add_argument('--no-verifier', action='store_true', help='Disable the second-opinion model')
     parser.add_argument('--no-auto-learn', action='store_true', help='Do not add camera-learned reference photos')
+    parser.add_argument('--no-liveness', action='store_true', help='Disable photo/screen (anti-spoofing) check')
     parser.add_argument('--no-pin', action='store_true', help='Do not verify camera identity (MAC) before sending credentials')
     parser.add_argument('--reset-pin', metavar='CAMERA_KEY', help='Forget the remembered identity of a replaced camera')
     args = parser.parse_args(argv)
@@ -869,6 +939,7 @@ def main(argv=None):
     if (args.download_models or args.download_verifier) and not (args.camera_key or args.config):
         if args.download_models:
             ensure_models(Path(args.models_dir), download=True)
+            load_liveness(Path(args.models_dir), download=True)
         if args.download_verifier:
             load_verifier(Path(args.models_dir), args.verifier, download=True)
         LOG.info('Models ready in %s', args.models_dir)

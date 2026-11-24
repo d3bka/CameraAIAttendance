@@ -497,7 +497,8 @@ pages.reviews = async () => {
   const { reviews } = await api(sPath('/reviews'));
   const cards = reviews.map(r => h('div', { class: 'review' },
     r.photo_id ? h('img', { src: photoUrl(r.photo_id), alt: 'эталонное фото' }) : h('div', { class: 'initial big' }, r.full_name.slice(0, 2)),
-    h('div', { class: 'event-body' }, h('strong', {}, `${r.full_name} · ${r.class_name}`),
+    h('div', { class: 'event-body' }, h('strong', {}, `${r.full_name} · ${r.class_name} `,
+      r.liveness !== null && r.liveness !== undefined && r.liveness < 0.5 ? tag('⚠ возможно фото или экран телефона', 'bad') : null),
       h('small', {}, `${r.camera_name} (${r.room}) · ${fmtDateTime(r.occurred_at)} · уверенность ${pct(r.confidence)}${r.second_score !== null && r.second_score !== undefined ? ' · 2-я модель ' + pct(r.second_score) : ''}`)),
     h('div', { class: 'actions' },
       h('button', { class: 'btn primary small', type: 'button', onclick: () => decide(r.id, 'confirm') }, 'Да, это он/она'),
